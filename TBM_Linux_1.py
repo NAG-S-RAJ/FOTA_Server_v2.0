@@ -2,7 +2,6 @@ import websocket
 import json
 import threading
 from campaign_control import CampaignControl, CampaignStopped
-
 campaign_control = CampaignControl()
 import time
 import requests

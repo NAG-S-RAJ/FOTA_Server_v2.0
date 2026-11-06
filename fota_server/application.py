@@ -4,7 +4,7 @@ import os
 
 from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from . import config as settings, database, state
 from .campaigns import campaign_watchdog, router as campaigns_router
@@ -22,6 +22,21 @@ async def root():
     return {
         "status": "running"
     }
+
+
+@router.get("/health/ready")
+async def readiness():
+    try:
+        database.ensure_connection()
+        database.cursor.execute("SELECT 1")
+        if database.cursor.fetchone() != (1,):
+            raise RuntimeError("Database readiness query returned no result")
+    except Exception:
+        return JSONResponse(
+            {"status": "not_ready", "checks": {"database": "unavailable"}},
+            status_code=503
+        )
+    return {"status": "ready", "checks": {"database": "ready"}}
 
 
 @router.get("/download_logs")

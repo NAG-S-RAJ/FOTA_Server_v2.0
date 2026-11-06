@@ -611,7 +611,7 @@ class ModularApplicationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_all_http_endpoints_remain_registered(self):
         expected = {
-            ("get", "/"), ("get", "/pending"), ("get", "/tbms"),
+            ("get", "/"), ("get", "/health/ready"), ("get", "/pending"), ("get", "/tbms"),
             ("get", "/logs"), ("get", "/download_logs"), ("get", "/campaigns"),
             ("post", "/campaign"), ("delete", "/campaign/{campaign_id}"),
             ("post", "/campaign/{campaign_id}/execute"), ("post", "/campaign/{campaign_id}/stop"),
@@ -626,6 +626,14 @@ class ModularApplicationTests(unittest.IsolatedAsyncioTestCase):
         actual = {(method, path) for path, methods in self.app.openapi()["paths"].items() for method in methods}
         self.assertEqual(actual, expected)
         self.assertEqual(await self.request("GET", "/"), (200, {"status": "running"}))
+
+    async def test_readiness_reports_database_health_without_leaking_errors(self):
+        status, result = await self.request("GET", "/health/ready")
+        self.assertEqual((status, result), (200, {"status": "ready", "checks": {"database": "ready"}}))
+        with patch.object(self.database_module, "ensure_connection", side_effect=RuntimeError("private DB detail")):
+            status, result = await self.request("GET", "/health/ready")
+        self.assertEqual(status, 503)
+        self.assertEqual(result, {"status": "not_ready", "checks": {"database": "unavailable"}})
 
     async def test_real_http_campaign_lifecycle(self):
         status, result = await self.request("POST", "/campaign", {
