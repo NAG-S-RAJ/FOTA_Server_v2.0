@@ -1,1 +1,0 @@
-"""FOTA server application modules."""
