@@ -235,6 +235,12 @@ def on_message(ws, message, campaign_worker=False):
     global approved
     global rejected
 
+    if not campaign_worker:
+        print(
+            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] SERVER RX: {message}",
+            flush=True,
+        )
+
     try:
 
         data = json.loads(message)
