@@ -80,7 +80,7 @@ print("VIN :", VIN)
 
 AUTH_SECRET = "FOTA_DEMO_SECRET"
 
-SERVER_WS = "wss://fota-demo-v2-0.onrender.com/ws"
+SERVER_WS = "wss://fota-server-v2-0.onrender.com/ws"
 
 DOWNLOAD_DIR = "/home/pi/FirmwareFiles"
 

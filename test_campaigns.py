@@ -170,7 +170,7 @@ class CampaignServerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.namespace["settings"] = SimpleNamespace(
             AUTH_SECRET="secret", UPLOAD_FOLDER=firmware_directory.name,
-            PUBLIC_URL="https://fota-demo-v2-0.onrender.com",
+            PUBLIC_URL="https://fota-server-v2-0.onrender.com",
             CAMPAIGN_ACK_TIMEOUT_SECONDS=600, CAMPAIGN_RUNNING_TIMEOUT_SECONDS=600,
             CAMPAIGN_WATCHDOG_INTERVAL_SECONDS=5
         )

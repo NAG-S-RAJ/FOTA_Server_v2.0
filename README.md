@@ -31,7 +31,7 @@ from the server package and keep their existing launch commands.
 
 ## Run and Build
 
-From `FOTA_Server_v1.0`, install dependencies:
+From `FOTA_Server_v2.0`, install dependencies:
 
 ```console
 python -m pip install -r requirements.txt
