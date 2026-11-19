@@ -1014,6 +1014,12 @@ class SgwDecoderTests(unittest.TestCase):
         self.assertEqual(self.decoder.parse_hex_lines(lines), bytes.fromhex("ecfa0300cb110200000000010806" + "0001"))
         self.assertEqual(self.decoder.decode_frame(b"\x00" * 5, "ec:fa:03:00:cb:11"), "Truncated frame (5 bytes)")
 
+    def test_tshark_hex_lines_ignore_ascii_column(self):
+        lines = ["0000  ec fa 03 00 cb 11 02 00 00 00 00 01 08 06 00 01   ..............ab",
+                 "0010  08 00                                             .."]
+        self.assertEqual(self.decoder.parse_tshark_hex_lines(lines),
+                         bytes.fromhex("ecfa0300cb110200000000010806000108 00".replace(" ", "")))
+
 
 if __name__ == "__main__":
     unittest.main()

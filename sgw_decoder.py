@@ -1,6 +1,7 @@
 """Decodes raw Ethernet frames captured from the SGW into one-line, human-readable summaries."""
 
 import ipaddress
+import re
 import struct
 
 ETHERTYPES = {
@@ -270,4 +271,17 @@ def parse_hex_lines(lines):
     for line in lines:
         _, _, hex_part = line.partition(":")
         data.extend(bytes.fromhex("".join(hex_part.split())))
+    return bytes(data)
+
+
+TSHARK_HEX_BYTES = re.compile(r"^[0-9a-fA-F]{4,}  ((?:[0-9a-fA-F]{2} {1,2}){0,15}[0-9a-fA-F]{2})")
+
+
+def parse_tshark_hex_lines(lines):
+    """Converts tshark -x hex dump lines ('0000  ec fa 03 00 ...   ascii') into bytes."""
+    data = bytearray()
+    for line in lines:
+        match = TSHARK_HEX_BYTES.match(line)
+        if match:
+            data.extend(bytes.fromhex(match.group(1).replace(" ", "")))
     return bytes(data)

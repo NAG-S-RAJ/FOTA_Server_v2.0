@@ -1,6 +1,8 @@
 import websocket
 import json
 import threading
+from tbm_monitor import TbmMonitor
+monitor = TbmMonitor("TBM_1")
 import time
 import requests
 import urllib3
@@ -32,6 +34,7 @@ urllib3.disable_warnings(
 )
 
 VIN = f"VH_{hostname}_{machine_id.replace('-', '')[-4:]}"
+monitor.vin = VIN
 print("VIN : ",VIN)
 AUTH_SECRET = "FOTA_DEMO_SECRET"
 DOWNLOAD_DIR = r"C:\FirmwareFiles"
@@ -44,6 +47,7 @@ os.makedirs(
 SERVER_WS = "wss://fota-server-v2-0.onrender.com/ws"
 
 approved = False
+rejected = False
 print("SERVER_WS =", SERVER_WS)
 
 def heartbeat(ws):
@@ -321,46 +325,57 @@ def on_close(ws, code, msg):
 
     print("\nDisconnected from server")
 
-while True:
 
-    try:
+def connection_loop():
 
-        approved = False
-        rejected = False
+    global approved, rejected
 
-        print("\nConnecting to FOTA Server...")
+    while not monitor.stop_event.is_set():
 
-        ws = websocket.WebSocketApp(
-            SERVER_WS,
-            on_open=on_open,
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close
-        )
+        try:
 
-        ws.run_forever(
-            ping_interval=20,
-            ping_timeout=10
-        )
+            approved = False
+            rejected = False
 
-    except Exception as e:
+            print("\nConnecting to FOTA Server...")
 
-        print("\nConnection Error:", e)
+            ws = monitor.create_websocket(
+                SERVER_WS,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close
+            )
 
-    if rejected:
+            ws.run_forever(
+                ping_interval=20,
+                ping_timeout=10
+            )
 
-        print(
-            "\nRequest rejected.\n"
-            "Retrying registration in 10 seconds..."
-        )
+        except Exception as e:
 
-        time.sleep(10)
+            print("\nConnection Error:", e)
 
-    else:
+        if monitor.stop_event.is_set():
+            break
 
-        print(
-            "\nConnection lost.\n"
-            "Retrying in 5 seconds..."
-        )
+        if rejected:
 
-        time.sleep(5)
+            print(
+                "\nRequest rejected.\n"
+                "Retrying registration in 10 seconds..."
+            )
+
+            monitor.stop_event.wait(10)
+
+        else:
+
+            print(
+                "\nConnection lost.\n"
+                "Retrying in 5 seconds..."
+            )
+
+            monitor.stop_event.wait(5)
+
+
+monitor.run(connection_loop)
