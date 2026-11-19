@@ -20,6 +20,11 @@ try:
 except ImportError:
     _ClientWebSocketApp = None
 
+if os.name == "nt":
+    from proxy_auth import enable_windows_proxy_auth
+else:
+    def enable_windows_proxy_auth(report=None):
+        return None
 from sgw_decoder import decode_frame, parse_hex_lines, parse_tshark_hex_lines
 
 IS_WINDOWS = os.name == "nt"
@@ -135,6 +140,10 @@ class TbmMonitor:
         self.started_at = datetime.datetime.now()
         self._terminal = sys.stdout
         sys.stdout = _LogStream(self, sys.stdout)
+        try:
+            enable_windows_proxy_auth(report=lambda message: self.log("TBM", message))
+        except Exception as error:
+            self.log("TBM", f"ERROR Windows proxy sign-on unavailable: {error}")
 
     # ------------------------------------------------------------------ logging
 

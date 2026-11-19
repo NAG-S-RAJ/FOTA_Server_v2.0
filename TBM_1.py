@@ -12,9 +12,9 @@ import uuid
 import re
 import subprocess
 from campaign_control import CampaignControl, CampaignStopped
-
 campaign_control = CampaignControl()
 
+#Run command: & C:\Users\nhl3cob\Desktop\FOTA_DEMO\.venv\Scripts\python.exe C:\Users\nhl3cob\Desktop\FOTA_DEMO\FOTA_Server\FOTA_Server_v2.0\TBM_1.py
 # Generate VIN Unique to the device
 hostname = socket.gethostname().upper()
 hostname = re.sub(r'[^A-Z0-9]','',hostname)
