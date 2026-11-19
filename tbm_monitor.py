@@ -14,7 +14,11 @@ import tempfile
 import threading
 import time
 
-import websocket
+try:
+    # websocket-client (pip install websocket-client)
+    from websocket import WebSocketApp as _ClientWebSocketApp
+except ImportError:
+    _ClientWebSocketApp = None
 
 from sgw_decoder import decode_frame, parse_hex_lines, parse_tshark_hex_lines
 
@@ -31,6 +35,59 @@ TBM_UPLOAD_MAX_LINES = 50
 # TX/RX are not forwarded: the server already logs every message it exchanges with the TBM.
 FORWARDED_SOURCES = ("TBM", "CAPTURE")
 WINDOW_MAX_LINES = 5000
+
+
+class _SyncWebSocketApp:
+    """websocket-client style app built on the 'websockets' package, used when websocket-client is missing."""
+
+    def __init__(self, url, on_open=None, on_message=None, on_error=None, on_close=None):
+        self.url = url
+        self.on_open, self.on_message, self.on_error, self.on_close = on_open, on_message, on_error, on_close
+        self._connection = None
+        self._send_lock = threading.Lock()
+
+    def _callback(self, callback, *args):
+        if callback is None:
+            return
+        try:
+            callback(self, *args)
+        except Exception as error:
+            if callback is not self.on_error and self.on_error is not None:
+                self.on_error(self, error)
+
+    def send(self, data):
+        connection = self._connection
+        if connection is None:
+            raise ConnectionError("WebSocket is not connected")
+        with self._send_lock:
+            connection.send(data)
+
+    def close(self):
+        connection = self._connection
+        if connection is not None:
+            connection.close()
+
+    def run_forever(self, ping_interval=20, ping_timeout=10, **_):
+        from websockets.sync.client import connect
+
+        connection = None
+        try:
+            connection = connect(self.url, ping_interval=ping_interval, ping_timeout=ping_timeout, open_timeout=15)
+            self._connection = connection
+            self._callback(self.on_open)
+            for message in connection:
+                self._callback(self.on_message, message)
+        except Exception as error:
+            self._callback(self.on_error, error)
+        finally:
+            self._connection = None
+            if connection is not None:
+                connection.close()
+            self._callback(self.on_close, getattr(connection, "close_code", None),
+                           getattr(connection, "close_reason", None))
+
+
+WebSocketApp = _ClientWebSocketApp or _SyncWebSocketApp
 
 
 class _LogStream:
@@ -101,7 +158,7 @@ class TbmMonitor:
     def create_websocket(self, url, on_open, on_message, on_error, on_close):
         monitor = self
 
-        class MonitoredWebSocketApp(websocket.WebSocketApp):
+        class MonitoredWebSocketApp(WebSocketApp):
             def send(self, data, *args, **kwargs):
                 monitor.log("TX -> SERVER", data)
                 return super().send(data, *args, **kwargs)

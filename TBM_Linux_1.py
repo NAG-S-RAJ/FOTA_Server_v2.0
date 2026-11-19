@@ -1,4 +1,3 @@
-import websocket
 import json
 import threading
 from tbm_monitor import TbmMonitor
@@ -639,6 +638,5 @@ def connection_loop():
             )
 
             monitor.stop_event.wait(5)
-
 
 monitor.run(connection_loop)

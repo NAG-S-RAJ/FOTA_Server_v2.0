@@ -1,4 +1,3 @@
-import websocket
 import json
 import threading
 from tbm_monitor import TbmMonitor
@@ -98,8 +97,13 @@ def on_open(ws):
 def on_message(ws, message, campaign_worker=False):
 
     global approved
+    global rejected
 
-    data = json.loads(message)
+    try:
+        data = json.loads(message)
+    except json.JSONDecodeError:
+        print("Invalid JSON received:", message)
+        return
     msg_type = data.get("type")
 
     if msg_type == "stop_campaign":
@@ -159,7 +163,6 @@ def on_message(ws, message, campaign_worker=False):
 
     elif msg_type == "rejected":
 
-        global rejected
         rejected = True
         print("\nConnection rejected")
         ws.close()
