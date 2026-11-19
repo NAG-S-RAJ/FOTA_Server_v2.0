@@ -7,6 +7,8 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from . import config as settings, database, state
 from .campaign_status import campaign_progress_value, is_active_campaign_status
+from .campaigns import fail_campaign, retry_waiting_campaigns
+from .events import record_campaign_event
 
 router = APIRouter(tags=["Devices"])
 
@@ -193,7 +195,7 @@ async def websocket_endpoint(
                        f"{vin} pending approval"
                    )
 
-            elif msg_type == "heartbeat":
+            elif msg_type in ("heartbeat", "campaign_request"):
                 if state.connected_tbms.get(vin) is not websocket:
                     continue
                 database.ensure_connection()
@@ -212,6 +214,9 @@ async def websocket_endpoint(
                 state.add_log(
                     f"Heartbeat Received -> {vin}"
                 )
+
+                # The vehicle ping is the only trigger for retrying failed campaigns.
+                await retry_waiting_campaigns(vin, websocket)
 
             elif msg_type == "campaign_ack":
                 if campaign_status.lower() != "sent":
@@ -237,6 +242,9 @@ async def websocket_endpoint(
 
                 database.conn.commit()
 
+                record_campaign_event(data["campaign_id"], vin, "Campaign Acknowledged", "RUNNING",
+                                      "Vehicle acknowledged the campaign.")
+
                 state.add_log(
                     f"{vin} campaign acknowledged"
                 )
@@ -252,6 +260,8 @@ async def websocket_endpoint(
                     (time.time(), data["campaign_id"], vin, campaign_status)
                 )
                 database.conn.commit()
+                record_campaign_event(data["campaign_id"], vin, "Deployment Started", "RUNNING",
+                                      "Vehicle started the deployment.")
 
             elif msg_type == "progress":
                 progress = campaign_progress_value(f"Downloading {data.get('progress')}%")
@@ -278,6 +288,9 @@ async def websocket_endpoint(
                 )
 
                 database.conn.commit()
+
+                record_campaign_event(data["campaign_id"], vin, "Download In Progress", "RUNNING",
+                                      f"Progress {progress:g}%")
 
                 state.add_log(
                     f"{vin} progress {data['progress']}%"
@@ -335,11 +348,12 @@ async def websocket_endpoint(
                 database.cursor.execute(
                     """
                     UPDATE campaigns
-                    SET status=%s, last_progress_at=%s
+                    SET status=%s, last_progress_at=%s, completed_at=%s
                     WHERE campaign_id=%s AND vin=%s AND status=%s
                     """,
                     (
                         "completed",
+                        time.time(),
                         time.time(),
                         data["campaign_id"],
                         vin,
@@ -348,6 +362,13 @@ async def websocket_endpoint(
                 )
             
                 database.conn.commit()
+
+                versions = ", ".join(
+                    f"{ecu.upper()} {data[ecu + '_version']}"
+                    for ecu in ("sgw", "spaak") if data.get(ecu + "_version")
+                )
+                record_campaign_event(data["campaign_id"], vin, "Completed", "SUCCESS",
+                                      f"Update installed: {versions or data['target_ecu']}")
             
                 state.add_log(
                     f"{vin} {data['target_ecu']} update completed"
@@ -356,37 +377,15 @@ async def websocket_endpoint(
             elif msg_type == "checksum_failed":
 
                 database.ensure_connection()
+                fail_campaign(data["campaign_id"], vin, campaign_status, "CHECKSUM_FAILED",
+                              "Firmware checksum verification failed.", time.time(),
+                              terminal_status="checksum_failed")
 
-                database.cursor.execute(
-                    """
-                    UPDATE campaigns
-                                        SET status=%s, error_code='CHECKSUM_FAILED',
-                                                error_message='Firmware checksum verification failed.', failed_at=%s
-                    WHERE campaign_id=%s
-                                            AND vin=%s AND status=%s
-                    """,
-                    (
-                        "checksum_failed",
-                        time.time(),
-                        data["campaign_id"],
-                        vin,
-                        campaign_status
-                    )
-                )
-
-                database.conn.commit()
-            
             elif msg_type in ("campaign_failed", "transfer_failed"):
                 database.ensure_connection()
-                database.cursor.execute(
-                    """
-                                        UPDATE campaigns SET status='failed', error_code=%s, error_message=%s, failed_at=%s
-                                        WHERE campaign_id=%s AND vin=%s AND status=%s
-                    """,
-                                        (msg_type.upper(), str(data.get("reason") or "Vehicle reported a deployment failure.")[:1000],
-                                         time.time(), data["campaign_id"], vin, campaign_status)
-                )
-                database.conn.commit()
+                fail_campaign(data["campaign_id"], vin, campaign_status, msg_type.upper(),
+                              str(data.get("reason") or "Vehicle reported a deployment failure.")[:1000],
+                              time.time())
 
             elif msg_type == "status_response":
 

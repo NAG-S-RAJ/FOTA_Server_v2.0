@@ -520,7 +520,8 @@ def on_message(ws, message, campaign_worker=False):
                 "\nDownload failed :",
                 e
             )
-            ws.send(json.dumps({"type": "campaign_failed", "campaign_id": campaign_id}))
+            ws.send(json.dumps({"type": "campaign_failed", "campaign_id": campaign_id,
+                                "reason": f"Download failed: {e}"}))
 
     # --------------------------------------------------------
     # OTHER SERVER MESSAGE

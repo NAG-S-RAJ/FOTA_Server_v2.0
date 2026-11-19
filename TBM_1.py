@@ -304,7 +304,8 @@ def on_message(ws, message, campaign_worker=False):
         except Exception as e:
         
             print("\nDownload failed :", e)
-            ws.send(json.dumps({"type": "campaign_failed", "campaign_id": campaign_id}))
+            ws.send(json.dumps({"type": "campaign_failed", "campaign_id": campaign_id,
+                                "reason": f"Download failed: {e}"}))
     
 
 def on_error(ws, error):

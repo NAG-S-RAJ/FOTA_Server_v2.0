@@ -7,8 +7,130 @@ from fastapi import APIRouter, HTTPException
 
 from . import config as settings, database, state, storage
 from .campaign_status import campaign_timeout_error
+from .events import record_campaign_event
 
 router = APIRouter(tags=["Campaigns"])
+
+
+def campaign_payload(campaign_id, target_ecu, campaign_name, sgw_target_version,
+                     spaak_target_version, sgw_firmware, spaak_firmware):
+    message = {
+        "type": "campaign",
+        "campaign_id": campaign_id,
+        "target_ecu": target_ecu,
+        "campaign_name": campaign_name,
+        "sgw_target_version": sgw_target_version,
+        "spaak_target_version": spaak_target_version,
+        "sgw_firmware": sgw_firmware,
+        "spaak_firmware": spaak_firmware
+    }
+    for ecu, firmware in (("sgw", sgw_firmware), ("spaak", spaak_firmware)):
+        download_url = checksum = ""
+        if firmware:
+            path = os.path.join(settings.UPLOAD_FOLDER, firmware)
+            if os.path.basename(firmware) != firmware or not os.path.exists(path):
+                raise FileNotFoundError(f"{ecu.upper()} firmware not found")
+            download_url = f"{settings.PUBLIC_URL}/files/{firmware}"
+            checksum = storage.get_sha256(path)
+        message[f"{ecu}_download_url"] = download_url
+        message[f"{ecu}_checksum"] = checksum
+    return message
+
+
+def fail_campaign(campaign_id, vin, expected_status, code, message, now,
+                  terminal_status="failed", extra_where="", extra_parameters=()):
+    """Fails the campaign, or parks it in waiting_retry while retries remain. Returns the new status."""
+    database.cursor.execute(
+        f"""
+        UPDATE campaigns
+        SET status=CASE WHEN COALESCE(retry_count, 0) < COALESCE(max_retries, 0)
+                        THEN 'waiting_retry' ELSE %s END,
+            error_code=%s, error_message=%s, failed_at=%s
+        WHERE campaign_id=%s AND vin=%s AND status=%s{extra_where}
+        RETURNING status, COALESCE(retry_count, 0), COALESCE(max_retries, 0)
+        """,
+        (terminal_status, code, message, now, campaign_id, vin, expected_status, *extra_parameters)
+    )
+    row = database.cursor.fetchone()
+    database.conn.commit()
+    if row is None:
+        return None
+    new_status, retry_count, max_retries = row
+    if new_status == "waiting_retry":
+        record_campaign_event(campaign_id, vin, "Failed - Waiting for Retry", "RUNNING",
+                              f"{message} ({code}). Retry {retry_count + 1} of {max_retries} "
+                              "starts when the vehicle is connected and pings.")
+    else:
+        record_campaign_event(campaign_id, vin, "Failed", "FAILED", f"{message} ({code})")
+    return new_status
+
+
+async def retry_waiting_campaigns(vin, websocket, now=None):
+    now = time.time() if now is None else now
+    database.ensure_connection()
+    database.cursor.execute(
+        """
+        SELECT 1 FROM campaigns
+        WHERE vin=%s AND (LOWER(status) IN ('sent', 'acknowledged', 'running', 'executing', 'in_progress')
+                          OR LOWER(status) LIKE %s)
+        """,
+        (vin, "downloading%")
+    )
+    if database.cursor.fetchone() is not None:
+        return None
+    database.cursor.execute(
+        """
+        SELECT campaign_id, target_ecu, campaign_name, sgw_target_version,
+               spaak_target_version, sgw_firmware, spaak_firmware
+        FROM campaigns
+        WHERE vin=%s AND status='waiting_retry' AND COALESCE(failed_at, 0) <= %s
+        ORDER BY created_at, campaign_id
+        LIMIT 1
+        """,
+        (vin, now - settings.CAMPAIGN_RETRY_DELAY_SECONDS)
+    )
+    row = database.cursor.fetchone()
+    if row is None:
+        return None
+    campaign_id = row[0]
+    try:
+        payload = campaign_payload(*row)
+    except FileNotFoundError as error:
+        database.cursor.execute(
+            """
+            UPDATE campaigns SET status='failed', error_code='FIRMWARE_MISSING', error_message=%s, failed_at=%s
+            WHERE campaign_id=%s AND status='waiting_retry'
+            """,
+            (str(error), now, campaign_id)
+        )
+        database.conn.commit()
+        record_campaign_event(campaign_id, vin, "Failed", "FAILED", f"{error} (FIRMWARE_MISSING)")
+        return None
+    database.cursor.execute(
+        """
+        UPDATE campaigns
+        SET status='sent', retry_count=COALESCE(retry_count, 0) + 1,
+            last_heartbeat_at=%s, last_progress_at=%s,
+            error_code=NULL, error_message=NULL, failed_at=NULL
+        WHERE campaign_id=%s AND status='waiting_retry'
+        RETURNING retry_count, max_retries
+        """,
+        (now, now, campaign_id)
+    )
+    claimed = database.cursor.fetchone()
+    database.conn.commit()
+    if claimed is None:
+        return None
+    record_campaign_event(campaign_id, vin, f"Retry {claimed[0]} Triggered", "RUNNING",
+                          f"Vehicle connected and pinged. Retry {claimed[0]} of {claimed[1]} sent.")
+    try:
+        await websocket.send_text(json.dumps(payload))
+    except Exception:
+        fail_campaign(campaign_id, vin, "sent", "SEND_FAILED", "Unable to send campaign retry to the vehicle.",
+                      time.time(), terminal_status="send_failed")
+        return None
+    state.add_log(f"Campaign retry {claimed[0]} sent -> {vin}: {campaign_id}")
+    return campaign_id
 
 
 def initialize_campaign_timers(now):
@@ -50,20 +172,14 @@ async def expire_stalled_campaigns(now=None):
         if error is None:
             continue
         code, message = error
-        database.cursor.execute(
-            """
-            UPDATE campaigns SET status='failed', error_code=%s, error_message=%s, failed_at=%s
-            WHERE campaign_id=%s AND status=%s
-              AND last_heartbeat_at=%s AND last_progress_at=%s
-            RETURNING vin
-            """,
-            (code, message, now, campaign_id, status, heartbeat_at, progress_at)
+        new_status = fail_campaign(
+            campaign_id, vin, status, code, message, now,
+            extra_where=" AND last_heartbeat_at=%s AND last_progress_at=%s",
+            extra_parameters=(heartbeat_at, progress_at)
         )
-        changed = database.cursor.fetchone()
-        database.conn.commit()
-        if changed is None:
+        if new_status is None:
             continue
-        failure = {"campaign_id": campaign_id, "error_code": code,
+        failure = {"campaign_id": campaign_id, "error_code": code, "status": new_status,
                    "error_message": message, "device_notified": False}
         websocket = state.connected_tbms.get(vin)
         if websocket is not None:
@@ -75,7 +191,7 @@ async def expire_stalled_campaigns(now=None):
                 failure["device_notified"] = True
             except Exception as error:
                 state.add_log(f"Campaign {campaign_id} stop notification failed: {error}")
-        state.add_log(f"Campaign {campaign_id} failed [{code}]: {message}")
+        state.add_log(f"Campaign {campaign_id} {new_status} [{code}]: {message}")
         failures.append(failure)
     return failures
 
@@ -101,6 +217,7 @@ async def delete_campaign(campaign_id: str):
         """,
         (campaign_id,)
     )
+    database.cursor.execute("DELETE FROM campaign_events WHERE campaign_id=%s", (campaign_id,))
 
     database.conn.commit()
 
@@ -130,7 +247,9 @@ async def get_campaigns():
             created_at,
             error_code,
             error_message,
-            failed_at
+            failed_at,
+            max_retries,
+            retry_count
         FROM campaigns
         ORDER BY created_at DESC NULLS LAST, campaign_id DESC
     """)
@@ -151,10 +270,48 @@ async def get_campaigns():
             "created_at":row[9],
             "error_code":row[10],
             "error_message":row[11],
-            "failed_at":row[12]
+            "failed_at":row[12],
+            "max_retries":row[13] or 0,
+            "retry_count":row[14] or 0
         }       
         for row in rows
     ]
+
+
+CAMPAIGN_DETAIL_FIELDS = (
+    "campaign_id", "vin", "target_ecu", "campaign_name", "sgw_target_version",
+    "spaak_target_version", "sgw_firmware", "spaak_firmware", "status", "created_at",
+    "error_code", "error_message", "failed_at", "execution_started_at",
+    "last_progress_at", "completed_at", "max_retries", "retry_count"
+)
+
+
+@router.get("/campaign/{campaign_id}")
+async def get_campaign(campaign_id: str):
+    database.ensure_connection()
+    database.cursor.execute(
+        f"SELECT {', '.join(CAMPAIGN_DETAIL_FIELDS)} FROM campaigns WHERE campaign_id=%s",
+        (campaign_id,)
+    )
+    row = database.cursor.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    result = dict(zip(CAMPAIGN_DETAIL_FIELDS, row))
+    result["max_retries"] = result["max_retries"] or 0
+    result["retry_count"] = result["retry_count"] or 0
+    result["vehicle_connected"] = result["vin"] in state.connected_tbms
+    database.cursor.execute(
+        """
+        SELECT event_type, status, detail, created_at FROM campaign_events
+        WHERE campaign_id=%s ORDER BY id DESC
+        """,
+        (campaign_id,)
+    )
+    result["history"] = [
+        {"event_type": event[0], "status": event[1], "detail": event[2], "created_at": event[3]}
+        for event in database.cursor.fetchall()
+    ]
+    return result
 
 
 @router.post("/campaign/{campaign_id}/stop")
@@ -165,7 +322,7 @@ async def stop_campaign(campaign_id: str):
         UPDATE campaigns
         SET status='stopped'
         WHERE campaign_id=%s
-            AND (LOWER(status) IN ('sent', 'acknowledged', 'running', 'executing', 'in_progress')
+            AND (LOWER(status) IN ('sent', 'acknowledged', 'running', 'executing', 'in_progress', 'waiting_retry')
                  OR LOWER(status) LIKE %s)
         RETURNING vin
         """,
@@ -202,6 +359,7 @@ async def stop_campaign(campaign_id: str):
             device_notified = True
         except Exception as error:
             state.add_log(f"Stop notification failed for {campaign_id}: {error}")
+    record_campaign_event(campaign_id, row[0], "Stopped", "STOPPED", "Stopped by operator.")
     state.add_log(f"Campaign stopped: {campaign_id}")
     return {"status": "stopped", "device_notified": device_notified,
             "message": "Campaign stopped."}
@@ -224,7 +382,9 @@ async def campaign(
 
     spaak_firmware:str="",
 
-    execute:bool=True
+    execute:bool=True,
+
+    max_retries:int=0
 
 ):
     campaign_id = campaign_id.strip()
@@ -234,6 +394,12 @@ async def campaign(
             "status": "error",
             "message": "Campaign ID is required"
         }
+
+    if not 0 <= max_retries <= settings.CAMPAIGN_MAX_RETRIES:
+        raise HTTPException(status_code=422, detail={
+            "code": "INVALID_RETRY_COUNT",
+            "message": f"Retry count must be between 0 and {settings.CAMPAIGN_MAX_RETRIES}."
+        })
     
     database.ensure_connection()
 
@@ -328,49 +494,13 @@ async def campaign(
                 "message":"Both firmware files and versions are required"
             }
 
-    base_url = settings.PUBLIC_URL
-    sgw_download_url = ""
-    spaak_download_url = ""
-    sgw_checksum = ""
-    spaak_checksum = ""
-    if sgw_firmware:
-
-        sgw_download_url = (
-            f"{base_url}/files/{sgw_firmware}"
+    try:
+        payload = campaign_payload(
+            campaign_id, target_ecu, campaign_name, sgw_target_version,
+            spaak_target_version, sgw_firmware, spaak_firmware
         )
-
-    if spaak_firmware:
-
-        spaak_download_url = (
-            f"{base_url}/files/{spaak_firmware}"
-        )
-    if sgw_firmware:
-            
-        path = os.path.join(
-            settings.UPLOAD_FOLDER,
-            sgw_firmware
-        )
-        if not os.path.exists(path):
-            return {
-                "status":"error",
-                "message":"SGW firmware not found"
-            }
-
-        sgw_checksum = storage.get_sha256(path)
-    
-    if spaak_firmware:
-
-        path = os.path.join(
-            settings.UPLOAD_FOLDER,
-            spaak_firmware
-        )
-        if not os.path.exists(path):
-            return {
-                "status":"error",
-                "message":"SPAAK firmware not found"
-            }
-
-        spaak_checksum = storage.get_sha256(path)
+    except FileNotFoundError as error:
+        return {"status": "error", "message": str(error)}
 
     database.ensure_connection()
     execution_started_at = time.time() if execute else None
@@ -379,7 +509,7 @@ async def campaign(
             database.cursor.execute(
                 """
                 UPDATE campaigns SET status='sent', execution_started_at=%s,
-                    last_heartbeat_at=%s, last_progress_at=%s,
+                    last_heartbeat_at=%s, last_progress_at=%s, retry_count=0,
                     error_code=NULL, error_message=NULL, failed_at=NULL
                 WHERE campaign_id=%s AND status IN ('pending', 'created')
                 RETURNING campaign_id
@@ -395,9 +525,10 @@ async def campaign(
                     campaign_id, vin, target_ecu, campaign_name,
                     sgw_target_version, spaak_target_version,
                     sgw_firmware, spaak_firmware, status,
-                    execution_started_at, last_heartbeat_at, last_progress_at
+                    execution_started_at, last_heartbeat_at, last_progress_at,
+                    max_retries, retry_count
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0)
                 """,
                 (
                     campaign_id,
@@ -411,7 +542,8 @@ async def campaign(
                     "sent" if execute else "pending",
                     execution_started_at,
                     execution_started_at,
-                    execution_started_at
+                    execution_started_at,
+                    max_retries
                 )
             )
 
@@ -430,55 +562,29 @@ async def campaign(
             "message":str(e)
         }
 
+    if existing is None:
+        record_campaign_event(campaign_id, vin, "Campaign Created", "PENDING",
+                              f"Target ECU: {target_ecu}. Retries allowed: {max_retries}.")
+
     if not execute:
         state.add_log(f"Campaign created: {campaign_id}")
         return {"status": "created", "campaign_id": campaign_id,
                 "message": "Campaign created and awaiting execution."}
 
+    record_campaign_event(campaign_id, vin, "Campaign Sent", "RUNNING",
+                          "Deployment package sent to the vehicle.")
     ws = state.connected_tbms[vin]
 
     try:
-        await ws.send_text(json.dumps({
-
-            "type":"campaign",
-
-            "campaign_id":campaign_id,
-
-            "target_ecu":target_ecu,
-
-            "campaign_name":campaign_name,
-
-            "sgw_target_version":sgw_target_version,
-
-            "spaak_target_version":spaak_target_version,
-
-            "sgw_firmware":sgw_firmware,
-
-            "spaak_firmware":spaak_firmware,
-
-            "sgw_download_url":sgw_download_url,
-
-            "spaak_download_url":spaak_download_url,
-
-            "sgw_checksum":sgw_checksum,
-
-            "spaak_checksum":spaak_checksum
-
-        }))
+        await ws.send_text(json.dumps(payload))
     except Exception:
-
-        database.cursor.execute(
-            """
-            UPDATE campaigns
-            SET status='send_failed', error_code='SEND_FAILED',
-                error_message='Unable to send campaign to the vehicle.', failed_at=%s
-            WHERE campaign_id=%s AND status='sent'
-            """,
-            (time.time(), campaign_id)
+        new_status = fail_campaign(
+            campaign_id, vin, "sent", "SEND_FAILED", "Unable to send campaign to the vehicle.",
+            time.time(), terminal_status="send_failed"
         )
-    
-        database.conn.commit()
-    
+        if new_status == "waiting_retry":
+            return {"status": "waiting_retry",
+                    "message": "Unable to send campaign. It will be retried when the vehicle connects and pings."}
         return {
             "status":"send_failed"
         }

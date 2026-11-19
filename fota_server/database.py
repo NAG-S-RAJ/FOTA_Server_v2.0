@@ -116,9 +116,25 @@ def initialize_database():
         ("last_progress_at", "DOUBLE PRECISION"),
         ("failed_at", "DOUBLE PRECISION"),
         ("error_code", "VARCHAR(64)"),
-        ("error_message", "TEXT")
+        ("error_message", "TEXT"),
+        ("max_retries", "INTEGER DEFAULT 0"),
+        ("retry_count", "INTEGER DEFAULT 0"),
+        ("completed_at", "DOUBLE PRECISION")
     ):
         cursor.execute(f"ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS {column} {definition}")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS campaign_events(
+        id SERIAL PRIMARY KEY,
+        campaign_id VARCHAR(100),
+        vin VARCHAR(50),
+        event_type VARCHAR(40),
+        status VARCHAR(50),
+        detail TEXT,
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS campaign_events_campaign_idx ON campaign_events (campaign_id, id)")
 
     conn.commit()
 

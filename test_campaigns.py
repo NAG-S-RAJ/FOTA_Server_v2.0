@@ -129,7 +129,12 @@ class CampaignServerTests(unittest.IsolatedAsyncioTestCase):
                 sgw_firmware TEXT, spaak_firmware TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 execution_started_at REAL, last_heartbeat_at REAL, last_progress_at REAL,
-                failed_at REAL, error_code TEXT, error_message TEXT
+                failed_at REAL, error_code TEXT, error_message TEXT,
+                max_retries INTEGER DEFAULT 0, retry_count INTEGER DEFAULT 0, completed_at REAL
+            );
+            CREATE TABLE campaign_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, campaign_id TEXT, vin TEXT, event_type TEXT,
+                status TEXT, detail TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE registered_tbms (vin TEXT PRIMARY KEY, sgw_version TEXT, spaak_version TEXT);
             INSERT INTO campaigns (campaign_id, vin, status) VALUES ('campaign-1', 'VIN1', 'sent');
@@ -172,14 +177,16 @@ class CampaignServerTests(unittest.IsolatedAsyncioTestCase):
             AUTH_SECRET="secret", UPLOAD_FOLDER=firmware_directory.name,
             PUBLIC_URL="https://fota-server-v2-0.onrender.com",
             CAMPAIGN_ACK_TIMEOUT_SECONDS=600, CAMPAIGN_RUNNING_TIMEOUT_SECONDS=600,
-            CAMPAIGN_WATCHDOG_INTERVAL_SECONDS=5
+            CAMPAIGN_WATCHDOG_INTERVAL_SECONDS=5, CAMPAIGN_RETRY_DELAY_SECONDS=30,
+            CAMPAIGN_MAX_RETRIES=10
         )
         self.namespace["storage"] = SimpleNamespace(get_sha256=self.namespace["get_sha256"])
         load_server_functions(self.namespace, {
             "stop_campaign", "websocket_endpoint", "campaign", "execute_campaign", "get_campaigns",
             "migrate_spaak_schema", "normalize_latest_firmware", "firmware_history", "version_key",
             "is_active_campaign_status", "campaign_timeout_error", "initialize_campaign_timers", "expire_stalled_campaigns",
-            "campaign_progress_value", "campaign_lifespan"
+            "campaign_progress_value", "campaign_lifespan", "campaign_payload", "fail_campaign",
+            "retry_waiting_campaigns", "record_campaign_event"
         })
 
     def status(self):
@@ -373,6 +380,46 @@ class CampaignServerTests(unittest.IsolatedAsyncioTestCase):
         await self.send_device_messages([{"type": "campaign_failed", "campaign_id": "campaign-1"}])
         self.assertEqual(self.status(), "failed")
 
+    async def test_failed_campaign_is_retried_only_when_vehicle_pings(self):
+        await self.namespace["campaign"](
+            campaign_id="retry-1", vin="VIN1", campaign_name="Retry update",
+            sgw_target_version="2.0", sgw_firmware="sgw.bin", execute=False, max_retries=2
+        )
+        self.database.execute("DELETE FROM campaigns WHERE campaign_id='campaign-1'")
+        socket = TestSocket()
+        self.namespace["connected_tbms"]["VIN1"] = socket
+        await self.namespace["execute_campaign"]("retry-1")
+        self.namespace["connected_tbms"].clear()
+        await self.send_device_messages([{"type": "campaign_failed", "campaign_id": "retry-1", "reason": "Download failed"}])
+        self.assertEqual(self.status(), "waiting_retry")
+        self.database.execute("UPDATE campaigns SET failed_at=1")
+        await self.send_device_messages([{"type": "heartbeat"}])
+        self.assertEqual(self.database.execute("SELECT status, retry_count FROM campaigns").fetchone(), ("sent", 1))
+        await self.send_device_messages([{"type": "campaign_failed", "campaign_id": "retry-1"}])
+        self.database.execute("UPDATE campaigns SET failed_at=1")
+        await self.send_device_messages([{"type": "heartbeat"}])
+        await self.send_device_messages([{"type": "campaign_failed", "campaign_id": "retry-1"}])
+        self.assertEqual(self.database.execute("SELECT status, retry_count FROM campaigns").fetchone(), ("failed", 2))
+        history = [row[0] for row in self.database.execute("SELECT event_type FROM campaign_events ORDER BY id")]
+        self.assertEqual(history[:3], ["Campaign Created", "Campaign Sent", "Failed - Waiting for Retry"])
+        self.assertIn("Retry 2 Triggered", history)
+        self.assertEqual(history[-1], "Failed")
+
+    async def test_retry_waits_for_delay_and_is_stoppable(self):
+        self.database.execute("UPDATE campaigns SET status='waiting_retry', max_retries=1, failed_at=?", (time.time(),))
+        await self.send_device_messages([{"type": "heartbeat"}])
+        self.assertEqual(self.status(), "waiting_retry")
+        result = await self.namespace["stop_campaign"]("campaign-1")
+        self.assertEqual((result["status"], self.status()), ("stopped", "stopped"))
+
+    async def test_invalid_retry_count_rejected(self):
+        with self.assertRaises(HTTPException) as raised:
+            await self.namespace["campaign"](
+                campaign_id="bad", vin="VIN1", campaign_name="x", sgw_target_version="2.0",
+                sgw_firmware="sgw.bin", execute=False, max_retries=11
+            )
+        self.assertEqual(raised.exception.status_code, 422)
+
     def set_campaign_timers(self, status, heartbeat_at, progress_at):
         self.database.execute(
             "UPDATE campaigns SET status=?, execution_started_at=1, last_heartbeat_at=?, last_progress_at=?",
@@ -564,7 +611,12 @@ class ModularApplicationTests(unittest.IsolatedAsyncioTestCase):
                 campaign_name TEXT, sgw_target_version TEXT, spaak_target_version TEXT,
                 sgw_firmware TEXT, spaak_firmware TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 execution_started_at REAL, last_heartbeat_at REAL, last_progress_at REAL,
-                failed_at REAL, error_code TEXT, error_message TEXT
+                failed_at REAL, error_code TEXT, error_message TEXT,
+                max_retries INTEGER DEFAULT 0, retry_count INTEGER DEFAULT 0, completed_at REAL
+            );
+            CREATE TABLE campaign_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, campaign_id TEXT, vin TEXT, event_type TEXT,
+                status TEXT, detail TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE registered_tbms (vin TEXT PRIMARY KEY, sgw_version TEXT, spaak_version TEXT, added_on TEXT);
             INSERT INTO registered_tbms VALUES ('VIN1', '1.0', '1.0', '2026-11-06T09:00:00Z');
@@ -613,7 +665,7 @@ class ModularApplicationTests(unittest.IsolatedAsyncioTestCase):
         expected = {
             ("get", "/"), ("get", "/health/ready"), ("get", "/pending"), ("get", "/tbms"),
             ("get", "/logs"), ("get", "/download_logs"), ("get", "/campaigns"),
-            ("post", "/campaign"), ("delete", "/campaign/{campaign_id}"),
+            ("post", "/campaign"), ("delete", "/campaign/{campaign_id}"), ("get", "/campaign/{campaign_id}"),
             ("post", "/campaign/{campaign_id}/execute"), ("post", "/campaign/{campaign_id}/stop"),
             ("get", "/registered_tbms"), ("get", "/registered_tbm/{vin}"),
             ("delete", "/registered_tbm/{vin}"), ("post", "/register_tbm"),
@@ -654,6 +706,12 @@ class ModularApplicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(socket.sent[-1]["type"], "stop_campaign")
         status, result = await self.request("GET", "/campaigns")
         self.assertEqual((status, result[0]["status"]), (200, "stopped"))
+        status, result = await self.request("GET", "/campaign/http-campaign")
+        self.assertEqual((status, result["status"]), (200, "stopped"))
+        self.assertEqual([event["event_type"] for event in result["history"]],
+                         ["Stopped", "Campaign Sent", "Campaign Created"])
+        status, result = await self.request("GET", "/campaign/missing")
+        self.assertEqual(status, 404)
         status, result = await self.request("GET", "/logs")
         self.assertEqual(status, 200)
         self.assertTrue(any("Campaign stopped" in message for message in result))
