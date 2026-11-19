@@ -1,6 +1,8 @@
 import websocket
 import json
 import threading
+from tbm_monitor import TbmMonitor
+monitor = TbmMonitor("TBM_Linux_EthTransfer")
 from campaign_control import CampaignControl, CampaignStopped
 
 campaign_control = CampaignControl()
@@ -70,6 +72,7 @@ DEVICE_ID_CLEAN = re.sub(
 
 # Generate VIN
 VIN = f"VH_{hostname}_{DEVICE_ID_CLEAN[-8:]}"
+monitor.vin = VIN
 
 print("VIN :", VIN)
 
@@ -672,58 +675,61 @@ def on_close(
 # MAIN CONNECTION LOOP
 # ============================================================
 
-while True:
+def connection_loop():
 
-    try:
+    global approved, rejected
 
-        approved = False
-        rejected = False
+    while not monitor.stop_event.is_set():
 
-        print(
-            "\nConnecting to FOTA Server..."
-        )
+        try:
 
-        ws = websocket.WebSocketApp(
+            approved = False
+            rejected = False
 
-            SERVER_WS,
+            print(
+                "\nConnecting to FOTA Server..."
+            )
 
-            on_open=on_open,
+            ws = monitor.create_websocket(
+                SERVER_WS,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close
+            )
 
-            on_message=on_message,
+            ws.run_forever(
+                ping_interval=20,
+                ping_timeout=10
+            )
 
-            on_error=on_error,
+        except Exception as e:
 
-            on_close=on_close
-        )
+            print(
+                "\nConnection Error:",
+                e
+            )
 
-        ws.run_forever(
+        if monitor.stop_event.is_set():
+            break
 
-            ping_interval=20,
+        if rejected:
 
-            ping_timeout=10
-        )
+            print(
+                "\nRequest rejected.\n"
+                "Retrying registration in 10 seconds..."
+            )
 
-    except Exception as e:
+            monitor.stop_event.wait(10)
 
-        print(
-            "\nConnection Error:",
-            e
-        )
+        else:
 
-    if rejected:
+            print(
+                "\nConnection lost.\n"
+                "Retrying in 5 seconds..."
+            )
 
-        print(
-            "\nRequest rejected.\n"
-            "Retrying registration in 10 seconds..."
-        )
+            monitor.stop_event.wait(5)
 
-        time.sleep(10)
 
-    else:
-
-        print(
-            "\nConnection lost.\n"
-            "Retrying in 5 seconds..."
-        )
-
-        time.sleep(5)
+monitor.run(connection_loop)

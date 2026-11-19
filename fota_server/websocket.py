@@ -30,14 +30,10 @@ async def websocket_endpoint(
 
             raw = await websocket.receive_text()
 
-            state.add_log(
-                f"[WS][RX] vin={vin} {raw}"
-            )
-
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError as error:
-                state.add_log(f"[WS][INVALID_JSON] vin={vin} {error}")
+                state.add_log(f"[WS][INVALID_JSON] vin={vin} {error}: {raw[:200]}")
                 continue
             if not isinstance(data, dict):
                 state.add_log(f"[WS][INVALID_MESSAGE] vin={vin} message is not a JSON object")
@@ -46,6 +42,12 @@ async def websocket_endpoint(
             msg_type = data.get(
                 "type"
             )
+
+            # Log batches are logged line by line below instead of as one raw message.
+            if msg_type not in ("sgw_traffic", "tbm_log"):
+                state.add_log(
+                    f"[WS][RX] vin={vin} {raw}"
+                )
 
             if msg_type in ("campaign_ack", "running", "progress", "completed", "checksum_failed", "campaign_failed", "transfer_failed"):
                 if state.connected_tbms.get(vin) is not websocket:
@@ -429,6 +431,30 @@ async def websocket_endpoint(
                     f"[DEVICE][STATUS] vin={vin}: "
                     f"{data.get('status')}"
                 )
+
+            elif msg_type in ("sgw_traffic", "sgw_capture", "tbm_log"):
+                area = "TBM" if msg_type == "tbm_log" else "SGW"
+                if state.connected_tbms.get(vin) is not websocket:
+                    state.add_log(f"[{area}][UNAUTHORIZED_MESSAGE] vin={vin} type={msg_type} from unapproved connection ignored")
+                    continue
+                if msg_type == "sgw_capture":
+                    capture_status = "".join(ch for ch in str(data.get("status") or "unknown").upper() if ch.isalnum() or ch == "_")
+                    state.add_log(f"[SGW][CAPTURE_{capture_status[:20]}] vin={vin} {str(data.get('detail') or '')[:300]}")
+                    continue
+                code = "LOG" if msg_type == "tbm_log" else "TRAFFIC"
+                lines = data.get("lines")
+                if not isinstance(lines, list):
+                    state.add_log(f"[{area}][INVALID_{code}] vin={vin} lines must be a list")
+                    continue
+                for line in lines[:50]:
+                    state.add_log(f"[{area}][{code}] vin={vin} {str(line)[:400]}")
+                try:
+                    dropped = int(data.get("dropped") or 0) + max(0, len(lines) - 50)
+                except (TypeError, ValueError):
+                    dropped = 0
+                if dropped > 0:
+                    state.add_log(f"[{area}][{code}_SUMMARIZED] vin={vin} {dropped} more line(s) not shown; "
+                                  "see the TBM log/capture file")
 
             else:
                 state.add_log(f"[WS][UNKNOWN_MESSAGE] vin={vin} type={msg_type!r} ignored")

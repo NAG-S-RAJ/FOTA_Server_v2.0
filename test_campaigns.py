@@ -402,6 +402,24 @@ class CampaignServerTests(unittest.IsolatedAsyncioTestCase):
         await self.send_device_messages([{"type": "campaign_failed", "campaign_id": "campaign-1"}])
         self.assertEqual(self.status(), "failed")
 
+    async def test_sgw_traffic_is_logged_for_approved_vehicle_only(self):
+        logs = []
+        self.namespace["state"].add_log = logs.append
+        await self.send_device_messages([
+            {"type": "sgw_capture", "status": "started", "detail": "interface=eth0"},
+            {"type": "sgw_traffic", "lines": ["10:00:00 ec:fa:03:00:cb:11 > aa:bb IPv4 udp 64"], "dropped": 3},
+            {"type": "tbm_log", "lines": ["10:00:01.000 [TBM] VEHICLE CONNECTION APPROVED"], "dropped": 0}
+        ])
+        self.assertTrue(any("[TBM][LOG] vin=VIN1 10:00:01.000 [TBM] VEHICLE CONNECTION APPROVED" in line for line in logs))
+        self.assertFalse(any("[WS][RX]" in line and "tbm_log" in line for line in logs))
+        self.assertTrue(any("[SGW][CAPTURE_STARTED] vin=VIN1 interface=eth0" in line for line in logs))
+        self.assertTrue(any("[SGW][TRAFFIC] vin=VIN1 10:00:00 ec:fa:03:00:cb:11" in line for line in logs))
+        self.assertTrue(any("[SGW][TRAFFIC_SUMMARIZED] vin=VIN1 3 more" in line for line in logs))
+        self.assertFalse(any("[WS][RX]" in line and "sgw_traffic" in line for line in logs))
+        logs.clear()
+        await self.namespace["websocket_endpoint"](TestSocket([{"type": "sgw_traffic", "lines": ["spoof"]}]))
+        self.assertFalse(any("[SGW][TRAFFIC]" in line for line in logs))
+
     async def test_failed_campaign_is_retried_only_when_vehicle_pings(self):
         await self.namespace["campaign"](
             campaign_id="retry-1", vin="VIN1", campaign_name="Retry update",
@@ -933,6 +951,68 @@ class CampaignDeviceTests(unittest.TestCase):
                 self.control.download(socket, "mock://firmware", str(destination))
             self.assertEqual(destination.read_bytes(), b"original")
             self.assertFalse(Path(str(destination) + ".part").exists())
+
+
+class SgwDecoderTests(unittest.TestCase):
+    SGW = bytes.fromhex("ecfa0300cb11")
+    TESTER = bytes.fromhex("020000000001")
+
+    def setUp(self):
+        import sgw_decoder
+        self.decoder = sgw_decoder
+
+    def ipv4_frame(self, source_mac, destination_mac, protocol, transport):
+        ip = bytearray(20)
+        ip[0], ip[9] = 0x45, protocol
+        ip[2:4] = (20 + len(transport)).to_bytes(2, "big")
+        ip[12:16], ip[16:20] = bytes([192, 168, 1, 10]), bytes([192, 168, 1, 20])
+        return destination_mac + source_mac + b"\x08\x00" + bytes(ip) + transport
+
+    def tcp(self, source_port, destination_port, payload):
+        header = source_port.to_bytes(2, "big") + destination_port.to_bytes(2, "big") + bytes(8)
+        return header + bytes([0x50, 0x18]) + bytes(6) + payload
+
+    def doip(self, payload_type, body):
+        return bytes([0x02, 0xFD]) + payload_type.to_bytes(2, "big") + len(body).to_bytes(4, "big") + body
+
+    def test_doip_uds_positive_and_negative_responses(self):
+        positive = self.doip(0x8001, bytes.fromhex("1010 0e00 5002".replace(" ", "")))
+        frame = self.ipv4_frame(self.SGW, self.TESTER, 6, self.tcp(13400, 51000, positive))
+        text = self.decoder.decode_frame(frame, "ec:fa:03:00:cb:11")
+        self.assertIn("SGW -> 02:00:00:00:00:01", text)
+        self.assertIn("192.168.1.10:13400 -> 192.168.1.20:51000", text)
+        self.assertIn("TCP [ACK,PSH]", text)
+        self.assertIn("DoIP Diagnostic message 0x1010 -> 0x0E00", text)
+        self.assertIn("UDS DiagnosticSessionControl +ve response (programmingSession)", text)
+        negative = self.doip(0x8001, bytes.fromhex("10100e007f3472"))
+        frame = self.ipv4_frame(self.SGW, self.TESTER, 6, self.tcp(13400, 51000, negative))
+        self.assertIn("UDS NEGATIVE RESPONSE RequestDownload NRC 0x72 generalProgrammingFailure",
+                      self.decoder.decode_frame(frame, "ec:fa:03:00:cb:11"))
+
+    def test_routing_activation_and_transfer_data_request(self):
+        payload = self.doip(0x0006, bytes.fromhex("0e00101010")) + \
+            self.doip(0x8001, bytes.fromhex("0e00101036" + "05" + "aabbcc"))
+        frame = self.ipv4_frame(self.TESTER, self.SGW, 6, self.tcp(51000, 13400, payload))
+        text = self.decoder.decode_frame(frame, "ec:fa:03:00:cb:11")
+        self.assertIn("02:00:00:00:00:01 -> SGW", text)
+        self.assertIn("Routing activation response tester 0x0E00 entity 0x1010 (successfully activated)", text)
+        self.assertIn("UDS TransferData request block 5 (3 data bytes)", text)
+
+    def test_someip_sd_offer_and_arp(self):
+        entry = bytes([0x01, 0, 0, 0]) + bytes.fromhex("1234") + bytes.fromhex("0001") + bytes([1, 0, 0, 3]) + bytes(4)
+        sd = bytes(4) + len(entry).to_bytes(4, "big") + entry + bytes(4)
+        someip = bytes.fromhex("ffff8100") + (8 + len(sd)).to_bytes(4, "big") + bytes.fromhex("00000001010102 00".replace(" ", "")) + sd
+        udp = (30490).to_bytes(2, "big") * 2 + (8 + len(someip)).to_bytes(2, "big") + bytes(2) + someip
+        text = self.decoder.decode_frame(self.ipv4_frame(self.SGW, b"\xff" * 6, 17, udp), "ec:fa:03:00:cb:11")
+        self.assertIn("SOME/IP-SD OfferService service 0x1234 instance 0x0001", text)
+        arp = b"\xff" * 6 + self.SGW + b"\x08\x06" + bytes.fromhex("0001080006040001") + self.SGW + \
+            bytes([192, 168, 1, 10]) + bytes(6) + bytes([192, 168, 1, 20])
+        self.assertIn("ARP who-has 192.168.1.20 tell 192.168.1.10", self.decoder.decode_frame(arp, "EC:FA:03:00:CB:11"))
+
+    def test_tcpdump_hex_lines_and_truncated_frames(self):
+        lines = ["\t0x0000:  ecfa 0300 cb11 0200 0000 0001 0806", "\t0x0010:  0001"]
+        self.assertEqual(self.decoder.parse_hex_lines(lines), bytes.fromhex("ecfa0300cb110200000000010806" + "0001"))
+        self.assertEqual(self.decoder.decode_frame(b"\x00" * 5, "ec:fa:03:00:cb:11"), "Truncated frame (5 bytes)")
 
 
 if __name__ == "__main__":
