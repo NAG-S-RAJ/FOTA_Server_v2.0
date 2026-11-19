@@ -7,7 +7,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from . import config as settings, database, state
 from .campaign_status import campaign_progress_value, is_active_campaign_status
-from .campaigns import fail_campaign, retry_waiting_campaigns
+from .campaigns import dispatch_waiting_campaigns, fail_campaign
 from .events import record_campaign_event
 
 router = APIRouter(tags=["Devices"])
@@ -215,8 +215,8 @@ async def websocket_endpoint(
                     f"Heartbeat Received -> {vin}"
                 )
 
-                # The vehicle ping is the only trigger for retrying failed campaigns.
-                await retry_waiting_campaigns(vin, websocket)
+                # Executed campaigns for this vehicle are only sent once it pings.
+                await dispatch_waiting_campaigns(vin, websocket)
 
             elif msg_type == "campaign_ack":
                 if campaign_status.lower() != "sent":

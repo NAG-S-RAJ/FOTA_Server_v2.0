@@ -186,7 +186,7 @@ class CampaignServerTests(unittest.IsolatedAsyncioTestCase):
             "migrate_spaak_schema", "normalize_latest_firmware", "firmware_history", "version_key",
             "is_active_campaign_status", "campaign_timeout_error", "initialize_campaign_timers", "expire_stalled_campaigns",
             "campaign_progress_value", "campaign_lifespan", "campaign_payload", "fail_campaign",
-            "retry_waiting_campaigns", "record_campaign_event"
+            "dispatch_waiting_campaigns", "record_campaign_event"
         })
 
     def status(self):
@@ -264,13 +264,34 @@ class CampaignServerTests(unittest.IsolatedAsyncioTestCase):
             await self.namespace["execute_campaign"]("draft-1")
         self.assertEqual(raised.exception.status_code, 409)
 
-    async def test_offline_execute_preserves_pending_campaign(self):
+    async def test_offline_execute_waits_for_vehicle_ping(self):
         await self.create_draft()
+        self.database.execute("DELETE FROM campaigns WHERE campaign_id='campaign-1'")
+        await self.send_device_messages([{"type": "heartbeat"}])
+        self.assertEqual(self.status(), "pending")
+        result = await self.namespace["execute_campaign"]("draft-1")
+        self.assertEqual((result["status"], self.status()), ("waiting_vehicle", "waiting_vehicle"))
         with self.assertRaises(HTTPException) as raised:
             await self.namespace["execute_campaign"]("draft-1")
         self.assertEqual(raised.exception.status_code, 409)
-        status = self.database.execute("SELECT status FROM campaigns WHERE campaign_id='draft-1'").fetchone()[0]
-        self.assertEqual(status, "pending")
+        authentication = [
+            {"type": "register_request", "vin": "VIN1"},
+            {"type": "auth_response", "vin": "VIN1", "response": hashlib.sha256(b"challengesecret").hexdigest()},
+            {"type": "heartbeat"}
+        ]
+        socket = TestSocket(authentication)
+        await self.namespace["websocket_endpoint"](socket)
+        self.assertEqual([message["type"] for message in socket.sent], ["challenge", "auth_passed", "approved", "campaign"])
+        self.assertEqual(socket.sent[-1]["campaign_id"], "draft-1")
+        row = self.database.execute("SELECT status, retry_count, execution_started_at FROM campaigns").fetchone()
+        self.assertEqual(row[:2], ("sent", 0))
+        self.assertIsNotNone(row[2])
+
+    async def test_waiting_vehicle_campaign_can_be_stopped(self):
+        await self.create_draft()
+        await self.namespace["execute_campaign"]("draft-1")
+        result = await self.namespace["stop_campaign"]("draft-1")
+        self.assertEqual(result["status"], "stopped")
 
     async def test_duplicate_execution_sends_only_once(self):
         await self.create_draft()

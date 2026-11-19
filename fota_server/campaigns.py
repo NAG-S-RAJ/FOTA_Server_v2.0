@@ -65,7 +65,8 @@ def fail_campaign(campaign_id, vin, expected_status, code, message, now,
     return new_status
 
 
-async def retry_waiting_campaigns(vin, websocket, now=None):
+async def dispatch_waiting_campaigns(vin, websocket, now=None):
+    """Sends executed campaigns queued for an offline vehicle, or due retries, once the vehicle pings."""
     now = time.time() if now is None else now
     database.ensure_connection()
     database.cursor.execute(
@@ -81,9 +82,10 @@ async def retry_waiting_campaigns(vin, websocket, now=None):
     database.cursor.execute(
         """
         SELECT campaign_id, target_ecu, campaign_name, sgw_target_version,
-               spaak_target_version, sgw_firmware, spaak_firmware
+               spaak_target_version, sgw_firmware, spaak_firmware, status
         FROM campaigns
-        WHERE vin=%s AND status='waiting_retry' AND COALESCE(failed_at, 0) <= %s
+        WHERE vin=%s AND (status='waiting_vehicle'
+                          OR (status='waiting_retry' AND COALESCE(failed_at, 0) <= %s))
         ORDER BY created_at, campaign_id
         LIMIT 1
         """,
@@ -92,44 +94,63 @@ async def retry_waiting_campaigns(vin, websocket, now=None):
     row = database.cursor.fetchone()
     if row is None:
         return None
-    campaign_id = row[0]
+    campaign_id, waiting_status = row[0], row[7]
     try:
-        payload = campaign_payload(*row)
+        payload = campaign_payload(*row[:7])
     except FileNotFoundError as error:
         database.cursor.execute(
             """
             UPDATE campaigns SET status='failed', error_code='FIRMWARE_MISSING', error_message=%s, failed_at=%s
-            WHERE campaign_id=%s AND status='waiting_retry'
+            WHERE campaign_id=%s AND status=%s
             """,
-            (str(error), now, campaign_id)
+            (str(error), now, campaign_id, waiting_status)
         )
         database.conn.commit()
         record_campaign_event(campaign_id, vin, "Failed", "FAILED", f"{error} (FIRMWARE_MISSING)")
         return None
-    database.cursor.execute(
-        """
-        UPDATE campaigns
-        SET status='sent', retry_count=COALESCE(retry_count, 0) + 1,
-            last_heartbeat_at=%s, last_progress_at=%s,
-            error_code=NULL, error_message=NULL, failed_at=NULL
-        WHERE campaign_id=%s AND status='waiting_retry'
-        RETURNING retry_count, max_retries
-        """,
-        (now, now, campaign_id)
-    )
-    claimed = database.cursor.fetchone()
-    database.conn.commit()
-    if claimed is None:
-        return None
-    record_campaign_event(campaign_id, vin, f"Retry {claimed[0]} Triggered", "RUNNING",
-                          f"Vehicle connected and pinged. Retry {claimed[0]} of {claimed[1]} sent.")
+    if waiting_status == "waiting_vehicle":
+        database.cursor.execute(
+            """
+            UPDATE campaigns
+            SET status='sent', execution_started_at=%s, last_heartbeat_at=%s, last_progress_at=%s
+            WHERE campaign_id=%s AND status='waiting_vehicle'
+            RETURNING campaign_id
+            """,
+            (now, now, now, campaign_id)
+        )
+        claimed = database.cursor.fetchone()
+        database.conn.commit()
+        if claimed is None:
+            return None
+        record_campaign_event(campaign_id, vin, "Campaign Sent", "RUNNING",
+                              "Vehicle connected and pinged. Deployment package sent to the vehicle.")
+        attempt_label = "Campaign"
+    else:
+        database.cursor.execute(
+            """
+            UPDATE campaigns
+            SET status='sent', retry_count=COALESCE(retry_count, 0) + 1,
+                last_heartbeat_at=%s, last_progress_at=%s,
+                error_code=NULL, error_message=NULL, failed_at=NULL
+            WHERE campaign_id=%s AND status='waiting_retry'
+            RETURNING retry_count, max_retries
+            """,
+            (now, now, campaign_id)
+        )
+        claimed = database.cursor.fetchone()
+        database.conn.commit()
+        if claimed is None:
+            return None
+        record_campaign_event(campaign_id, vin, f"Retry {claimed[0]} Triggered", "RUNNING",
+                              f"Vehicle connected and pinged. Retry {claimed[0]} of {claimed[1]} sent.")
+        attempt_label = f"Campaign retry {claimed[0]}"
     try:
         await websocket.send_text(json.dumps(payload))
     except Exception:
-        fail_campaign(campaign_id, vin, "sent", "SEND_FAILED", "Unable to send campaign retry to the vehicle.",
+        fail_campaign(campaign_id, vin, "sent", "SEND_FAILED", "Unable to send campaign to the vehicle.",
                       time.time(), terminal_status="send_failed")
         return None
-    state.add_log(f"Campaign retry {claimed[0]} sent -> {vin}: {campaign_id}")
+    state.add_log(f"{attempt_label} sent -> {vin}: {campaign_id}")
     return campaign_id
 
 
@@ -322,7 +343,8 @@ async def stop_campaign(campaign_id: str):
         UPDATE campaigns
         SET status='stopped'
         WHERE campaign_id=%s
-            AND (LOWER(status) IN ('sent', 'acknowledged', 'running', 'executing', 'in_progress', 'waiting_retry')
+            AND (LOWER(status) IN ('sent', 'acknowledged', 'running', 'executing', 'in_progress',
+                                   'waiting_retry', 'waiting_vehicle')
                  OR LOWER(status) LIKE %s)
         RETURNING vin
         """,
@@ -425,11 +447,7 @@ async def campaign(
     database.cursor.execute("SELECT 1 FROM registered_tbms WHERE vin=%s", (vin,))
     if database.cursor.fetchone() is None:
         raise HTTPException(status_code=404, detail="VIN not registered")
-    if execute and vin not in state.connected_tbms:
-        raise HTTPException(status_code=409, detail={
-            "code": "VEHICLE_NOT_CONNECTED",
-            "message": "Vehicle is offline. Connect it before executing the campaign."
-        })
+    vehicle_online = vin in state.connected_tbms
 
     if sgw_firmware and spaak_firmware:
     
@@ -503,18 +521,20 @@ async def campaign(
         return {"status": "error", "message": str(error)}
 
     database.ensure_connection()
-    execution_started_at = time.time() if execute else None
+    send_now = execute and vehicle_online
+    new_status = ("sent" if send_now else "waiting_vehicle") if execute else "pending"
+    execution_started_at = time.time() if send_now else None
     try:
         if existing is not None:
             database.cursor.execute(
                 """
-                UPDATE campaigns SET status='sent', execution_started_at=%s,
+                UPDATE campaigns SET status=%s, execution_started_at=%s,
                     last_heartbeat_at=%s, last_progress_at=%s, retry_count=0,
                     error_code=NULL, error_message=NULL, failed_at=NULL
                 WHERE campaign_id=%s AND status IN ('pending', 'created')
                 RETURNING campaign_id
                 """,
-                (execution_started_at, execution_started_at, execution_started_at, campaign_id)
+                (new_status, execution_started_at, execution_started_at, execution_started_at, campaign_id)
             )
             if database.cursor.fetchone() is None:
                 raise HTTPException(status_code=409, detail="Campaign is no longer awaiting execution")
@@ -539,7 +559,7 @@ async def campaign(
                     spaak_target_version,
                     sgw_firmware,
                     spaak_firmware,
-                    "sent" if execute else "pending",
+                    new_status,
                     execution_started_at,
                     execution_started_at,
                     execution_started_at,
@@ -570,6 +590,13 @@ async def campaign(
         state.add_log(f"Campaign created: {campaign_id}")
         return {"status": "created", "campaign_id": campaign_id,
                 "message": "Campaign created and awaiting execution."}
+
+    if not send_now:
+        record_campaign_event(campaign_id, vin, "Waiting for Vehicle", "PENDING",
+                              "Execution requested. Vehicle is offline; campaign starts when it connects and pings.")
+        state.add_log(f"Campaign queued until {vin} connects: {campaign_id}")
+        return {"status": "waiting_vehicle", "campaign_id": campaign_id,
+                "message": "Vehicle is offline. Campaign will start when the vehicle connects and pings."}
 
     record_campaign_event(campaign_id, vin, "Campaign Sent", "RUNNING",
                           "Deployment package sent to the vehicle.")
