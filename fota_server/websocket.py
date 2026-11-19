@@ -21,6 +21,8 @@ async def websocket_endpoint(
     await websocket.accept()
 
     vin = None
+    client = getattr(websocket, "client", None)
+    state.add_log(f"[WS][CONNECTION_OPENED] client={client}")
 
     try:
 
@@ -29,10 +31,17 @@ async def websocket_endpoint(
             raw = await websocket.receive_text()
 
             state.add_log(
-                f"RX: {raw}"
+                f"[WS][RX] vin={vin} {raw}"
             )
 
-            data = json.loads(raw)
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as error:
+                state.add_log(f"[WS][INVALID_JSON] vin={vin} {error}")
+                continue
+            if not isinstance(data, dict):
+                state.add_log(f"[WS][INVALID_MESSAGE] vin={vin} message is not a JSON object")
+                continue
 
             msg_type = data.get(
                 "type"
@@ -40,6 +49,7 @@ async def websocket_endpoint(
 
             if msg_type in ("campaign_ack", "running", "progress", "completed", "checksum_failed", "campaign_failed", "transfer_failed"):
                 if state.connected_tbms.get(vin) is not websocket:
+                    state.add_log(f"[DEVICE][UNAUTHORIZED_MESSAGE] vin={vin} type={msg_type} from unapproved connection ignored")
                     continue
                 database.ensure_connection()
                 database.cursor.execute(
@@ -47,7 +57,12 @@ async def websocket_endpoint(
                     (data.get("campaign_id"), vin)
                 )
                 campaign_row = database.cursor.fetchone()
-                if campaign_row is None or not is_active_campaign_status(campaign_row[0]):
+                if campaign_row is None:
+                    state.add_log(f"[DEVICE][CAMPAIGN_NOT_FOUND] vin={vin} type={msg_type} campaign={data.get('campaign_id')}")
+                    continue
+                if not is_active_campaign_status(campaign_row[0]):
+                    state.add_log(f"[DEVICE][LATE_MESSAGE_IGNORED] vin={vin} type={msg_type} "
+                                  f"campaign={data.get('campaign_id')} status={campaign_row[0]}")
                     continue
                 campaign_status = campaign_row[0]
 
@@ -76,7 +91,7 @@ async def websocket_endpoint(
                 )
 
                 state.add_log(
-                    f"Challenge sent -> {vin}"
+                    f"[AUTH][CHALLENGE_SENT] vin={vin}"
                 )
 
             elif msg_type == "auth_response":
@@ -87,6 +102,8 @@ async def websocket_endpoint(
 
                if vin not in state.pending_auth:
 
+                   state.add_log(f"[AUTH][NO_PENDING_CHALLENGE] vin={vin} auth_response without challenge; closing")
+
                    await websocket.close()
 
                    continue
@@ -96,7 +113,7 @@ async def websocket_endpoint(
                if time.time() - state.pending_auth[vin]["timestamp"] > 60:
 
                    state.add_log(
-                       f"{vin} auth timeout"
+                       f"[AUTH][AUTH_TIMEOUT] vin={vin} challenge older than 60s; closing"
                    )
 
                    del state.pending_auth[vin]
@@ -117,7 +134,7 @@ async def websocket_endpoint(
                if response != expected:
 
                    state.add_log(
-                       f"{vin} authentication failed"
+                       f"[AUTH][AUTH_FAILED] vin={vin} invalid challenge response; closing"
                    )
 
                    del state.pending_auth[vin]
@@ -138,7 +155,7 @@ async def websocket_endpoint(
                        })
                    )
                state.add_log(
-                   f"{vin} authentication passed"
+                   f"[AUTH][AUTH_PASSED] vin={vin}"
                )
 
                del state.pending_auth[vin]
@@ -168,7 +185,7 @@ async def websocket_endpoint(
                         )
                 
                         state.add_log(
-                            f"Duplicate connection rejected -> {vin}"
+                            f"[AUTH][DUPLICATE_CONNECTION] vin={vin} already connected; new connection rejected"
                         )
                 
                         await websocket.close()
@@ -184,7 +201,7 @@ async def websocket_endpoint(
                    )
 
                    state.add_log(
-                       f"{vin} auto-approved"
+                       f"[AUTH][CONNECTED] vin={vin} auto-approved; online vehicles={len(state.connected_tbms)}"
                    )
 
                else:
@@ -192,11 +209,12 @@ async def websocket_endpoint(
                    state.pending_tbms[vin] = websocket
 
                    state.add_log(
-                       f"{vin} pending approval"
+                       f"[AUTH][PENDING_APPROVAL] vin={vin} not registered; waiting for operator approval"
                    )
 
             elif msg_type in ("heartbeat", "campaign_request"):
                 if state.connected_tbms.get(vin) is not websocket:
+                    state.add_log(f"[DEVICE][HEARTBEAT_IGNORED] vin={vin} type={msg_type} from unapproved connection")
                     continue
                 database.ensure_connection()
                 database.cursor.execute(
@@ -212,7 +230,7 @@ async def websocket_endpoint(
                 database.conn.commit()
 
                 state.add_log(
-                    f"Heartbeat Received -> {vin}"
+                    f"[DEVICE][PING] vin={vin} type={msg_type}"
                 )
 
                 # Executed campaigns for this vehicle are only sent once it pings.
@@ -220,6 +238,7 @@ async def websocket_endpoint(
 
             elif msg_type == "campaign_ack":
                 if campaign_status.lower() != "sent":
+                    state.add_log(f"[DEVICE][ACK_IGNORED] vin={vin} campaign={data['campaign_id']} status={campaign_status}")
                     continue
 
                 database.ensure_connection()
@@ -246,11 +265,12 @@ async def websocket_endpoint(
                                       "Vehicle acknowledged the campaign.")
 
                 state.add_log(
-                    f"{vin} campaign acknowledged"
+                    f"[DEVICE][ACKNOWLEDGED] vin={vin} campaign={data['campaign_id']} sent -> acknowledged"
                 )
 
             elif msg_type == "running":
                 if campaign_status.lower() not in ("sent", "acknowledged"):
+                    state.add_log(f"[DEVICE][RUNNING_IGNORED] vin={vin} campaign={data['campaign_id']} status={campaign_status}")
                     continue
                 database.cursor.execute(
                     """
@@ -262,11 +282,18 @@ async def websocket_endpoint(
                 database.conn.commit()
                 record_campaign_event(data["campaign_id"], vin, "Deployment Started", "RUNNING",
                                       "Vehicle started the deployment.")
+                state.add_log(f"[DEVICE][RUNNING] vin={vin} campaign={data['campaign_id']} {campaign_status} -> running")
 
             elif msg_type == "progress":
                 progress = campaign_progress_value(f"Downloading {data.get('progress')}%")
                 previous_progress = campaign_progress_value(campaign_status)
-                if progress is None or (previous_progress is not None and progress <= previous_progress):
+                if progress is None:
+                    state.add_log(f"[DEVICE][INVALID_PROGRESS] vin={vin} campaign={data['campaign_id']} "
+                                  f"progress={data.get('progress')!r}")
+                    continue
+                if previous_progress is not None and progress <= previous_progress:
+                    state.add_log(f"[DEVICE][PROGRESS_NOT_ADVANCING] vin={vin} campaign={data['campaign_id']} "
+                                  f"{progress:g}% <= {previous_progress:g}%")
                     continue
 
                 database.ensure_connection()
@@ -293,7 +320,7 @@ async def websocket_endpoint(
                                       f"Progress {progress:g}%")
 
                 state.add_log(
-                    f"{vin} progress {data['progress']}%"
+                    f"[DEVICE][PROGRESS] vin={vin} campaign={data['campaign_id']} {data['progress']}%"
                 )
 
             elif msg_type == "completed":
@@ -344,6 +371,10 @@ async def websocket_endpoint(
                             vin
                         )
                     )
+
+                else:
+                    state.add_log(f"[DEVICE][UNKNOWN_TARGET_ECU] vin={vin} campaign={data['campaign_id']} "
+                                  f"target_ecu={data.get('target_ecu')!r}; versions not updated")
             
                 database.cursor.execute(
                     """
@@ -371,17 +402,22 @@ async def websocket_endpoint(
                                       f"Update installed: {versions or data['target_ecu']}")
             
                 state.add_log(
-                    f"{vin} {data['target_ecu']} update completed"
+                    f"[DEVICE][COMPLETED] vin={vin} campaign={data['campaign_id']} {data['target_ecu']} "
+                    f"update completed: {versions or '-'}"
                 )
 
             elif msg_type == "checksum_failed":
 
+                state.add_log(f"[DEVICE][CHECKSUM_FAILED] vin={vin} campaign={data['campaign_id']} "
+                              "vehicle reported checksum mismatch")
                 database.ensure_connection()
                 fail_campaign(data["campaign_id"], vin, campaign_status, "CHECKSUM_FAILED",
                               "Firmware checksum verification failed.", time.time(),
                               terminal_status="checksum_failed")
 
             elif msg_type in ("campaign_failed", "transfer_failed"):
+                state.add_log(f"[DEVICE][{msg_type.upper()}] vin={vin} campaign={data['campaign_id']} "
+                              f"reason={data.get('reason') or '-'}")
                 database.ensure_connection()
                 fail_campaign(data["campaign_id"], vin, campaign_status, msg_type.upper(),
                               str(data.get("reason") or "Vehicle reported a deployment failure.")[:1000],
@@ -390,15 +426,23 @@ async def websocket_endpoint(
             elif msg_type == "status_response":
 
                 state.add_log(
-                    f"{vin}: "
-                    f"{data['status']}"
+                    f"[DEVICE][STATUS] vin={vin}: "
+                    f"{data.get('status')}"
                 )
 
-    except WebSocketDisconnect:
+            else:
+                state.add_log(f"[WS][UNKNOWN_MESSAGE] vin={vin} type={msg_type!r} ignored")
+
+    except WebSocketDisconnect as disconnect:
 
         state.add_log(
-            f"{vin} disconnected"
+            f"[WS][DISCONNECTED] vin={vin} code={getattr(disconnect, 'code', None)}"
         )
+
+    except Exception as error:
+
+        state.add_log(f"[WS][CONNECTION_ERROR] vin={vin} {type(error).__name__}: {error}")
+        raise
 
     finally:
 
@@ -411,7 +455,7 @@ async def websocket_endpoint(
                     del state.pending_tbms[vin]
     
                     state.add_log(
-                        f"Removed pending {vin}"
+                        f"[WS][REMOVED_PENDING] vin={vin}"
                     )
     
             if vin in state.connected_tbms:
@@ -421,5 +465,5 @@ async def websocket_endpoint(
                     del state.connected_tbms[vin]
     
                     state.add_log(
-                        f"Removed connected {vin}"
+                        f"[WS][VEHICLE_OFFLINE] vin={vin} removed; online vehicles={len(state.connected_tbms)}"
                     )

@@ -21,14 +21,16 @@ async def delete_registered_tbm(
         DELETE
         FROM registered_tbms
         WHERE vin=%s
+        RETURNING vin
         """,
         (vin,)
     )
+    deleted = database.cursor.fetchone()
 
     database.conn.commit()
 
     state.add_log(
-        f"Vehicle Deleted: {vin}"
+        f"[VEHICLE][DELETED] vin={vin}" if deleted else f"[VEHICLE][VIN_NOT_FOUND] delete requested for vin={vin}"
     )
 
     return {
@@ -63,6 +65,8 @@ async def get_tbm(
     row = database.cursor.fetchone()
 
     if not row:
+
+        state.add_log(f"[VEHICLE][VIN_NOT_FOUND] version lookup for vin={vin}")
 
         return {
             "status": "not_found"
@@ -136,7 +140,7 @@ async def register_tbm(
         database.conn.commit()
 
         state.add_log(
-            f"Vehicle Registered: {vin}"
+            f"[VEHICLE][REGISTERED] vin={vin} sgw={sgw_version} spaak={spaak_version}"
         )
 
         return {
@@ -146,6 +150,8 @@ async def register_tbm(
     except psycopg2.IntegrityError:
 
         database.conn.rollback()
+
+        state.add_log(f"[VEHICLE][ALREADY_EXISTS] vin={vin} registration skipped")
 
         return {
             "status": "already_exists"
@@ -198,6 +204,8 @@ async def approve(vin: str):
 
     if vin not in state.pending_tbms:
 
+        state.add_log(f"[APPROVAL][NOT_PENDING] approve requested for vin={vin}")
+
         return {
             "status": "not_found"
         }
@@ -238,7 +246,7 @@ async def approve(vin: str):
     except Exception as e:
 
         state.add_log(
-            f"Database Error: {e}"
+            f"[APPROVAL][DB_ERROR] vin={vin} {type(e).__name__}: {e}"
         )
 
         return {
@@ -257,7 +265,7 @@ async def approve(vin: str):
     )
 
     state.add_log(
-        f"{vin} approved and registered"
+        f"[APPROVAL][APPROVED] vin={vin} approved and registered; online vehicles={len(state.connected_tbms)}"
     )
 
     return {
@@ -269,6 +277,8 @@ async def approve(vin: str):
 async def reject(vin: str):
 
     if vin not in state.pending_tbms:
+
+        state.add_log(f"[APPROVAL][NOT_PENDING] reject requested for vin={vin}")
 
         return {
             "status": "not_found"
@@ -287,7 +297,7 @@ async def reject(vin: str):
     del state.pending_tbms[vin]
 
     state.add_log(
-        f"{vin} rejected"
+        f"[APPROVAL][REJECTED] vin={vin}"
     )
 
     return {

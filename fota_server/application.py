@@ -31,7 +31,8 @@ async def readiness():
         database.cursor.execute("SELECT 1")
         if database.cursor.fetchone() != (1,):
             raise RuntimeError("Database readiness query returned no result")
-    except Exception:
+    except Exception as error:
+        state.add_log(f"[SERVER][DB_UNAVAILABLE] readiness check failed: {type(error).__name__}")
         return JSONResponse(
             {"status": "not_ready", "checks": {"database": "unavailable"}},
             status_code=503
@@ -59,12 +60,15 @@ async def get_logs():
 
 @asynccontextmanager
 async def campaign_lifespan(application):
+    state.add_log("[SERVER][STARTING] initializing database and campaign watchdog")
     database.initialize_database()
     os.makedirs(settings.UPLOAD_FOLDER, exist_ok=True)
     watchdog = asyncio.create_task(campaign_watchdog())
+    state.add_log(f"[SERVER][READY] uploads={settings.UPLOAD_FOLDER} public_url={settings.PUBLIC_URL}")
     try:
         yield
     finally:
+        state.add_log("[SERVER][STOPPING] cancelling watchdog and closing database")
         watchdog.cancel()
         with suppress(asyncio.CancelledError):
             await watchdog

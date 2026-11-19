@@ -1,6 +1,6 @@
 import psycopg2
 
-from . import config as settings
+from . import config as settings, state
 
 conn = None
 cursor = None
@@ -13,7 +13,7 @@ def connect_db():
     conn.autocommit = True
     cursor = conn.cursor()
 
-    print("Database connected")
+    state.add_log("[DB][CONNECTED] database connection established")
 
 
 def ensure_connection():
@@ -31,7 +31,7 @@ def ensure_connection():
         cursor.execute("SELECT 1")
 
     except Exception as e:
-        print(f"DB reconnect: {e}")
+        state.add_log(f"[DB][RECONNECT] connection lost ({type(e).__name__}: {e}); reconnecting")
         connect_db()
 
 
@@ -137,6 +137,8 @@ def initialize_database():
     cursor.execute("CREATE INDEX IF NOT EXISTS campaign_events_campaign_idx ON campaign_events (campaign_id, id)")
 
     conn.commit()
+
+    state.add_log("[DB][SCHEMA_READY] tables and migrations verified")
 
 
 def close_database():
