@@ -12,6 +12,10 @@ from .events import record_campaign_event
 router = APIRouter(tags=["Campaigns"])
 
 
+def format_epoch(value):
+    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(value))
+
+
 def campaign_payload(campaign_id, target_ecu, campaign_name, sgw_target_version,
                      spaak_target_version, sgw_firmware, spaak_firmware):
     message = {
@@ -253,12 +257,64 @@ async def expire_stalled_campaigns(now=None):
     return failures
 
 
+async def start_scheduled_campaigns(now=None):
+    now = time.time() if now is None else now
+    database.ensure_connection()
+    database.cursor.execute(
+        """
+        SELECT campaign_id, vin, scheduled_at FROM campaigns
+        WHERE status='scheduled' AND scheduled_at <= %s
+        ORDER BY scheduled_at, campaign_id
+        """,
+        (now,)
+    )
+    started = []
+    for campaign_id, vin, scheduled_at in database.cursor.fetchall():
+        # Hand the campaign to the normal Execute path, which only accepts pending campaigns.
+        database.cursor.execute(
+            "UPDATE campaigns SET status='pending' WHERE campaign_id=%s AND status='scheduled' RETURNING campaign_id",
+            (campaign_id,)
+        )
+        claimed = database.cursor.fetchone()
+        database.conn.commit()
+        if claimed is None:
+            state.add_log(f"[SCHEDULE][CLAIM_LOST] campaign={campaign_id} no longer scheduled")
+            continue
+        state.add_log(f"[SCHEDULE][SCHEDULE_REACHED] campaign={campaign_id} vin={vin} "
+                      f"scheduled_at={format_epoch(scheduled_at)}; executing automatically")
+        record_campaign_event(campaign_id, vin, "Schedule Reached", "RUNNING",
+                              f"Scheduled time {format_epoch(scheduled_at)} reached. Executing automatically.")
+        try:
+            result = await campaign(campaign_id=campaign_id, vin="", campaign_name="")
+        except HTTPException as error:
+            result = {"status": "error", "code": "AUTO_EXECUTE_FAILED", "message": str(error.detail)}
+        if result.get("status") == "error":
+            code = result.get("code") or "AUTO_EXECUTE_FAILED"
+            message = result.get("message") or "Scheduled execution failed."
+            database.cursor.execute(
+                """
+                UPDATE campaigns SET status='failed', error_code=%s, error_message=%s, failed_at=%s
+                WHERE campaign_id=%s AND status='pending'
+                """,
+                (code, message, time.time(), campaign_id)
+            )
+            database.conn.commit()
+            state.add_log(f"[SCHEDULE][{code}] campaign={campaign_id} vin={vin} auto-execution failed: {message}")
+            record_campaign_event(campaign_id, vin, "Failed", "FAILED", f"{message} ({code})")
+        started.append({"campaign_id": campaign_id, "status": result.get("status")})
+    return started
+
+
 async def campaign_watchdog():
     state.add_log(f"[WATCHDOG][STARTED] interval={settings.CAMPAIGN_WATCHDOG_INTERVAL_SECONDS}s "
                   f"ack_timeout={settings.CAMPAIGN_ACK_TIMEOUT_SECONDS}s "
                   f"running_timeout={settings.CAMPAIGN_RUNNING_TIMEOUT_SECONDS}s "
                   f"retry_delay={settings.CAMPAIGN_RETRY_DELAY_SECONDS}s")
     while True:
+        try:
+            await start_scheduled_campaigns()
+        except Exception as error:
+            state.add_log(f"[SCHEDULE][SCHEDULER_ERROR] {type(error).__name__}: {error}")
         try:
             await expire_stalled_campaigns()
         except Exception as error:
@@ -313,7 +369,9 @@ async def get_campaigns():
             error_message,
             failed_at,
             max_retries,
-            retry_count
+            retry_count,
+            initiation,
+            scheduled_at
         FROM campaigns
         ORDER BY created_at DESC NULLS LAST, campaign_id DESC
     """)
@@ -336,7 +394,9 @@ async def get_campaigns():
             "error_message":row[11],
             "failed_at":row[12],
             "max_retries":row[13] or 0,
-            "retry_count":row[14] or 0
+            "retry_count":row[14] or 0,
+            "initiation":row[15] or "immediate",
+            "scheduled_at":row[16]
         }       
         for row in rows
     ]
@@ -346,7 +406,8 @@ CAMPAIGN_DETAIL_FIELDS = (
     "campaign_id", "vin", "target_ecu", "campaign_name", "sgw_target_version",
     "spaak_target_version", "sgw_firmware", "spaak_firmware", "status", "created_at",
     "error_code", "error_message", "failed_at", "execution_started_at",
-    "last_progress_at", "completed_at", "max_retries", "retry_count"
+    "last_progress_at", "completed_at", "max_retries", "retry_count",
+    "initiation", "scheduled_at", "description"
 )
 
 
@@ -364,6 +425,7 @@ async def get_campaign(campaign_id: str):
     result = dict(zip(CAMPAIGN_DETAIL_FIELDS, row))
     result["max_retries"] = result["max_retries"] or 0
     result["retry_count"] = result["retry_count"] or 0
+    result["initiation"] = result["initiation"] or "immediate"
     result["vehicle_connected"] = result["vin"] in state.connected_tbms
     database.cursor.execute(
         """
@@ -388,7 +450,7 @@ async def stop_campaign(campaign_id: str):
         SET status='stopped'
         WHERE campaign_id=%s
             AND (LOWER(status) IN ('sent', 'acknowledged', 'running', 'executing', 'in_progress',
-                                   'waiting_retry', 'waiting_vehicle')
+                                   'waiting_retry', 'waiting_vehicle', 'scheduled')
                  OR LOWER(status) LIKE %s)
         RETURNING vin
         """,
@@ -458,12 +520,21 @@ async def campaign(
 
     execute:bool=True,
 
-    max_retries:int=0
+    max_retries:int=0,
+
+    initiation:str="immediate",
+
+    scheduled_at:float=None,
+
+    description:str=""
 
 ):
     campaign_id = campaign_id.strip()
+    initiation = (initiation or "immediate").strip().lower()
+    description = (description or "").strip()
     state.add_log(f"[CAMPAIGN][REQUEST] campaign={campaign_id or '<empty>'} vin={vin or '<stored>'} execute={execute} "
-                  f"max_retries={max_retries} sgw={sgw_target_version or '-'}:{sgw_firmware or '-'} "
+                  f"max_retries={max_retries} initiation={initiation} scheduled_at={scheduled_at} "
+                  f"sgw={sgw_target_version or '-'}:{sgw_firmware or '-'} "
                   f"spaak={spaak_target_version or '-'}:{spaak_firmware or '-'}")
 
     if not campaign_id:
@@ -480,13 +551,35 @@ async def campaign(
             "code": "INVALID_RETRY_COUNT",
             "message": f"Retry count must be between 0 and {settings.CAMPAIGN_MAX_RETRIES}."
         })
+
+    if initiation not in ("immediate", "scheduled"):
+        state.add_log(f"[CAMPAIGN][INVALID_INITIATION] campaign={campaign_id} initiation={initiation!r}")
+        raise HTTPException(status_code=422, detail={
+            "code": "INVALID_INITIATION",
+            "message": "Server initiated must be one of: immediate, scheduled."
+        })
+    if initiation == "scheduled":
+        if scheduled_at is None or scheduled_at <= time.time():
+            state.add_log(f"[CAMPAIGN][INVALID_SCHEDULE] campaign={campaign_id} scheduled_at={scheduled_at}")
+            raise HTTPException(status_code=422, detail={
+                "code": "INVALID_SCHEDULE",
+                "message": "Scheduled campaigns need a start time in the future."
+            })
+    else:
+        scheduled_at = None
+    if len(description) > 1000:
+        state.add_log(f"[CAMPAIGN][DESCRIPTION_TOO_LONG] campaign={campaign_id} length={len(description)}")
+        raise HTTPException(status_code=422, detail={
+            "code": "DESCRIPTION_TOO_LONG",
+            "message": "Description must be at most 1000 characters."
+        })
     
     database.ensure_connection()
 
     database.cursor.execute(
         """
          SELECT vin, campaign_name, sgw_target_version, spaak_target_version,
-             sgw_firmware, spaak_firmware, status
+             sgw_firmware, spaak_firmware, status, initiation, scheduled_at
         FROM campaigns
         WHERE campaign_id=%s
         """,
@@ -503,6 +596,9 @@ async def campaign(
                 "message": "Campaign already exists or is no longer awaiting execution."
             })
         vin, campaign_name, sgw_target_version, spaak_target_version, sgw_firmware, spaak_firmware = existing[:6]
+        initiation, scheduled_at = existing[7] or "immediate", existing[8]
+    elif initiation == "scheduled":
+        execute = False
 
     database.cursor.execute("SELECT 1 FROM registered_tbms WHERE vin=%s", (vin,))
     if database.cursor.fetchone() is None:
@@ -545,7 +641,10 @@ async def campaign(
 
     database.ensure_connection()
     send_now = execute and vehicle_online
-    new_status = ("sent" if send_now else "waiting_vehicle") if execute else "pending"
+    if execute:
+        new_status = "sent" if send_now else "waiting_vehicle"
+    else:
+        new_status = "scheduled" if initiation == "scheduled" else "pending"
     execution_started_at = time.time() if send_now else None
     try:
         if existing is not None:
@@ -570,9 +669,9 @@ async def campaign(
                     sgw_target_version, spaak_target_version,
                     sgw_firmware, spaak_firmware, status,
                     execution_started_at, last_heartbeat_at, last_progress_at,
-                    max_retries, retry_count
+                    max_retries, retry_count, initiation, scheduled_at, description
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s)
                 """,
                 (
                     campaign_id,
@@ -587,7 +686,10 @@ async def campaign(
                     execution_started_at,
                     execution_started_at,
                     execution_started_at,
-                    max_retries
+                    max_retries,
+                    initiation,
+                    scheduled_at,
+                    description
                 )
             )
 
@@ -609,22 +711,28 @@ async def campaign(
         }
 
     if existing is None:
+        schedule_detail = (f" Scheduled start: {format_epoch(scheduled_at)}." if scheduled_at else "")
         record_campaign_event(campaign_id, vin, "Campaign Created", "PENDING",
-                              f"Target ECU: {target_ecu}. Retries allowed: {max_retries}.")
+                              f"Target ECU: {target_ecu}. Server initiated: {initiation}.{schedule_detail} "
+                              f"Retries allowed: {max_retries}.")
 
     if not execute:
+        if new_status == "scheduled":
+            state.add_log(f"[CAMPAIGN][SCHEDULED] Campaign created: {campaign_id} vin={vin} target_ecu={target_ecu} "
+                          f"max_retries={max_retries}; executes automatically at {format_epoch(scheduled_at)}")
+            return {"status": "scheduled", "campaign_id": campaign_id, "scheduled_at": scheduled_at,
+                    "message": "Campaign created and will execute automatically at the scheduled time."}
         state.add_log(f"[CAMPAIGN][CREATED] Campaign created: {campaign_id} vin={vin} target_ecu={target_ecu} "
                       f"max_retries={max_retries}; waiting for Execute")
         return {"status": "created", "campaign_id": campaign_id,
                 "message": "Campaign created and awaiting execution."}
 
     if not send_now:
-        record_campaign_event(campaign_id, vin, "Waiting for Vehicle", "PENDING",
-                              "Execution requested. Vehicle is offline; campaign starts when it connects and pings.")
-        state.add_log(f"[EXECUTE][VEHICLE_OFFLINE] campaign={campaign_id} vin={vin} -> waiting_vehicle; "
-                      "will dispatch on next ping")
-        return {"status": "waiting_vehicle", "campaign_id": campaign_id,
-                "message": "Vehicle is offline. Campaign will start when the vehicle connects and pings."}
+        message = "Vehicle is offline. Campaign will start when the vehicle connects and pings."
+        record_campaign_event(campaign_id, vin, "Waiting for Vehicle", "PENDING", message)
+        state.add_log(f"[EXECUTE][VEHICLE_OFFLINE] campaign={campaign_id} vin={vin} initiation={initiation} "
+                      "-> waiting_vehicle; will dispatch on next ping")
+        return {"status": "waiting_vehicle", "campaign_id": campaign_id, "message": message}
 
     record_campaign_event(campaign_id, vin, "Campaign Sent", "RUNNING",
                           "Deployment package sent to the vehicle.")

@@ -130,7 +130,8 @@ class CampaignServerTests(unittest.IsolatedAsyncioTestCase):
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 execution_started_at REAL, last_heartbeat_at REAL, last_progress_at REAL,
                 failed_at REAL, error_code TEXT, error_message TEXT,
-                max_retries INTEGER DEFAULT 0, retry_count INTEGER DEFAULT 0, completed_at REAL
+                max_retries INTEGER DEFAULT 0, retry_count INTEGER DEFAULT 0, completed_at REAL,
+                initiation TEXT DEFAULT 'immediate', scheduled_at REAL, description TEXT
             );
             CREATE TABLE campaign_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, campaign_id TEXT, vin TEXT, event_type TEXT,
@@ -186,7 +187,7 @@ class CampaignServerTests(unittest.IsolatedAsyncioTestCase):
             "migrate_spaak_schema", "normalize_latest_firmware", "firmware_history", "version_key",
             "is_active_campaign_status", "campaign_timeout_error", "initialize_campaign_timers", "expire_stalled_campaigns",
             "campaign_progress_value", "campaign_lifespan", "campaign_payload", "fail_campaign",
-            "dispatch_waiting_campaigns", "record_campaign_event"
+            "dispatch_waiting_campaigns", "record_campaign_event", "format_epoch", "start_scheduled_campaigns"
         })
 
     def status(self):
@@ -441,6 +442,55 @@ class CampaignServerTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(raised.exception.status_code, 422)
 
+    async def create_mode_campaign(self, initiation, scheduled_at=None):
+        self.database.execute("DELETE FROM campaigns")
+        result = await self.namespace["campaign"](
+            campaign_id="mode-1", vin="VIN1", campaign_name="Mode", sgw_target_version="2.0",
+            sgw_firmware="sgw.bin", execute=False, initiation=initiation, scheduled_at=scheduled_at,
+            description="Gateway fix"
+        )
+        return result
+
+    async def test_scheduled_campaign_executes_automatically_when_online(self):
+        result = await self.create_mode_campaign("scheduled", time.time() + 3600)
+        self.assertEqual((result["status"], self.status()), ("scheduled", "scheduled"))
+        self.assertEqual(self.database.execute("SELECT description FROM campaigns").fetchone()[0], "Gateway fix")
+        with self.assertRaises(HTTPException):
+            await self.namespace["execute_campaign"]("mode-1")
+        socket = TestSocket()
+        self.namespace["connected_tbms"]["VIN1"] = socket
+        self.assertEqual(await self.namespace["start_scheduled_campaigns"](), [])
+        self.assertEqual(socket.sent, [])
+        self.database.execute("UPDATE campaigns SET scheduled_at=?", (time.time() - 1,))
+        started = await self.namespace["start_scheduled_campaigns"]()
+        self.assertEqual(started, [{"campaign_id": "mode-1", "status": "sent"}])
+        self.assertEqual((self.status(), socket.sent[0]["type"]), ("sent", "campaign"))
+
+    async def test_scheduled_campaign_waits_for_offline_vehicle_ping(self):
+        await self.create_mode_campaign("scheduled", time.time() + 3600)
+        self.database.execute("UPDATE campaigns SET scheduled_at=?", (time.time() - 1,))
+        await self.namespace["start_scheduled_campaigns"]()
+        self.assertEqual(self.status(), "waiting_vehicle")
+        await self.send_device_messages([{"type": "heartbeat"}])
+        self.assertEqual(self.status(), "sent")
+
+    async def test_scheduled_campaign_can_be_cancelled(self):
+        await self.create_mode_campaign("scheduled", time.time() + 3600)
+        self.assertEqual((await self.namespace["stop_campaign"]("mode-1"))["status"], "stopped")
+        self.database.execute("UPDATE campaigns SET scheduled_at=?", (time.time() - 1,))
+        self.assertEqual(await self.namespace["start_scheduled_campaigns"](), [])
+        self.assertEqual(self.status(), "stopped")
+
+    async def test_invalid_schedule_and_initiation_rejected(self):
+        for initiation, scheduled_at in (("scheduled", None), ("scheduled", time.time() - 10), ("urgent", None), ("none", None)):
+            with self.subTest(initiation=initiation, scheduled_at=scheduled_at):
+                with self.assertRaises(HTTPException) as raised:
+                    await self.namespace["campaign"](
+                        campaign_id="bad", vin="VIN1", campaign_name="x", sgw_target_version="2.0",
+                        sgw_firmware="sgw.bin", execute=False, initiation=initiation, scheduled_at=scheduled_at
+                    )
+                self.assertEqual(raised.exception.status_code, 422)
+
     def set_campaign_timers(self, status, heartbeat_at, progress_at):
         self.database.execute(
             "UPDATE campaigns SET status=?, execution_started_at=1, last_heartbeat_at=?, last_progress_at=?",
@@ -633,7 +683,8 @@ class ModularApplicationTests(unittest.IsolatedAsyncioTestCase):
                 sgw_firmware TEXT, spaak_firmware TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 execution_started_at REAL, last_heartbeat_at REAL, last_progress_at REAL,
                 failed_at REAL, error_code TEXT, error_message TEXT,
-                max_retries INTEGER DEFAULT 0, retry_count INTEGER DEFAULT 0, completed_at REAL
+                max_retries INTEGER DEFAULT 0, retry_count INTEGER DEFAULT 0, completed_at REAL,
+                initiation TEXT DEFAULT 'immediate', scheduled_at REAL, description TEXT
             );
             CREATE TABLE campaign_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, campaign_id TEXT, vin TEXT, event_type TEXT,

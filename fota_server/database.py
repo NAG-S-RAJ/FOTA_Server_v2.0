@@ -119,7 +119,10 @@ def initialize_database():
         ("error_message", "TEXT"),
         ("max_retries", "INTEGER DEFAULT 0"),
         ("retry_count", "INTEGER DEFAULT 0"),
-        ("completed_at", "DOUBLE PRECISION")
+        ("completed_at", "DOUBLE PRECISION"),
+        ("initiation", "VARCHAR(20) DEFAULT 'immediate'"),
+        ("scheduled_at", "DOUBLE PRECISION"),
+        ("description", "TEXT")
     ):
         cursor.execute(f"ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS {column} {definition}")
 
