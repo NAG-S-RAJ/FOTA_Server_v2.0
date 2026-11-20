@@ -13,6 +13,9 @@ import sys
 import tempfile
 import threading
 import time
+from urllib.parse import urlsplit, urlunsplit
+
+import requests
 
 try:
     # websocket-client (pip install websocket-client)
@@ -132,6 +135,7 @@ class TbmMonitor:
         self.tbm_pending = []
         self.tbm_dropped = 0
         self.ws = None
+        self.server_http_url = None
         self.server_connected = False
         self.approved = False
         self.stop_event = threading.Event()
@@ -166,6 +170,11 @@ class TbmMonitor:
 
     def create_websocket(self, url, on_open, on_message, on_error, on_close):
         monitor = self
+        parsed_url = urlsplit(url)
+        http_scheme = {"ws": "http", "wss": "https"}.get(parsed_url.scheme)
+        if http_scheme:
+            base_path = parsed_url.path.rsplit("/", 1)[0]
+            self.server_http_url = urlunsplit((http_scheme, parsed_url.netloc, base_path, "", "")).rstrip("/")
 
         class MonitoredWebSocketApp(WebSocketApp):
             def send(self, data, *args, **kwargs):
@@ -415,6 +424,21 @@ class TbmMonitor:
                 if source_format != target_format:
                     self.log("CAPTURE", f"editcap not found; capture saved in {source_format.lstrip('.')} format")
             saved.append(target)
+            if target.lower().endswith(".pcapng") and self.server_http_url:
+                try:
+                    with open(target, "rb") as capture:
+                        response = requests.put(
+                            self.server_http_url + "/upload_capture",
+                            data=capture,
+                            headers={"Content-Type": "application/octet-stream"},
+                            timeout=(10, 300)
+                        )
+                    response.raise_for_status()
+                    self.log("CAPTURE", "PCAPNG uploaded to FOTA server")
+                    saved.append("PCAPNG uploaded to FOTA server")
+                except (OSError, requests.RequestException) as error:
+                    self.log("CAPTURE", f"Server upload failed: {type(error).__name__}: {error}")
+                    saved.append("Server upload failed; dashboard ZIP will not contain this capture")
         log_file = os.path.splitext(target)[0] + ".log"
         with self.lock, open(log_file, "w", encoding="utf-8") as file:
             file.write("\n".join(self.lines) + "\n")

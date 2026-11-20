@@ -3,6 +3,7 @@ import asyncio
 from contextlib import asynccontextmanager, suppress
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from urllib.parse import urlencode
+import zipfile
 
 
 ROOT = Path(__file__).parent
@@ -176,6 +178,7 @@ class CampaignServerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.namespace["settings"] = SimpleNamespace(
             AUTH_SECRET="secret", UPLOAD_FOLDER=firmware_directory.name,
+            CAPTURE_FOLDER=firmware_directory.name,
             PUBLIC_URL="https://fota-server-v2-0.onrender.com",
             CAMPAIGN_ACK_TIMEOUT_SECONDS=600, CAMPAIGN_RUNNING_TIMEOUT_SECONDS=600,
             CAMPAIGN_WATCHDOG_INTERVAL_SECONDS=5, CAMPAIGN_RETRY_DELAY_SECONDS=30,
@@ -719,6 +722,7 @@ class ModularApplicationTests(unittest.IsolatedAsyncioTestCase):
             patch.object(database, "cursor", DatabaseCursor(self.database)),
             patch.object(database, "ensure_connection", lambda: None),
             patch.object(config, "UPLOAD_FOLDER", directory.name),
+            patch.object(config, "CAPTURE_FOLDER", str(Path(directory.name) / "captures")),
             patch.object(state, "pending_auth", {}),
             patch.object(state, "pending_tbms", {}),
             patch.object(state, "connected_tbms", {}),
@@ -730,31 +734,46 @@ class ModularApplicationTests(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(replacement.stop)
         self.app = application.create_app()
 
-    async def request(self, method, path, parameters=None):
+    async def request_raw(self, method, path, parameters=None, body=b"", headers=()):
         messages = []
+        response_complete = asyncio.Event()
+        request_delivered = False
         scope = {
             "type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"},
             "http_version": "1.1", "method": method, "scheme": "http", "path": path,
             "raw_path": path.encode(), "query_string": urlencode(parameters or {}).encode(),
-            "root_path": "", "headers": [(b"host", b"testserver")],
+            "root_path": "", "headers": [(b"host", b"testserver"), *headers],
             "client": ("127.0.0.1", 1234), "server": ("testserver", 80)
         }
 
         async def receive():
-            return {"type": "http.request", "body": b"", "more_body": False}
+            nonlocal request_delivered
+            if not request_delivered:
+                request_delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            await response_complete.wait()
+            return {"type": "http.disconnect"}
 
         async def send(message):
             messages.append(message)
+            if message["type"] == "http.response.body" and not message.get("more_body", False):
+                response_complete.set()
 
         await self.app(scope, receive, send)
         status = next(message["status"] for message in messages if message["type"] == "http.response.start")
+        response_headers = next(message["headers"] for message in messages if message["type"] == "http.response.start")
         body = b"".join(message.get("body", b"") for message in messages)
+        return status, dict(response_headers), body
+
+    async def request(self, method, path, parameters=None):
+        status, _, body = await self.request_raw(method, path, parameters)
         return status, json.loads(body)
 
     async def test_all_http_endpoints_remain_registered(self):
         expected = {
             ("get", "/"), ("get", "/health/ready"), ("get", "/pending"), ("get", "/tbms"),
             ("get", "/logs"), ("get", "/download_logs"), ("get", "/campaigns"),
+            ("put", "/upload_capture"),
             ("post", "/campaign"), ("delete", "/campaign/{campaign_id}"), ("get", "/campaign/{campaign_id}"),
             ("post", "/campaign/{campaign_id}/execute"), ("post", "/campaign/{campaign_id}/stop"),
             ("get", "/registered_tbms"), ("get", "/registered_tbm/{vin}"),
@@ -768,6 +787,21 @@ class ModularApplicationTests(unittest.IsolatedAsyncioTestCase):
         actual = {(method, path) for path, methods in self.app.openapi()["paths"].items() for method in methods}
         self.assertEqual(actual, expected)
         self.assertEqual(await self.request("GET", "/"), (200, {"status": "running"}))
+
+    async def test_download_logs_zip_contains_text_log_and_uploaded_pcapng(self):
+        capture = b"\x0a\x0d\x0d\x0a" + b"pcapng test data"
+        self.state.logs[:] = ["server log line"]
+        status, headers, body = await self.request_raw("PUT", "/upload_capture", body=capture)
+        self.assertEqual((status, json.loads(body)), (200, {"status": "uploaded", "size": len(capture)}))
+
+        status, headers, body = await self.request_raw("GET", "/download_logs")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers[b"content-type"], b"application/zip")
+        self.assertRegex(headers[b"content-disposition"].decode(), r'FOTA_Logs_\d{8}_\d{6}\.zip')
+        with zipfile.ZipFile(io.BytesIO(body)) as archive:
+            self.assertEqual(set(archive.namelist()), {"FOTA_Server_Log.txt", "FOTA_Capture.pcapng"})
+            self.assertIn(b"server log line", archive.read("FOTA_Server_Log.txt"))
+            self.assertEqual(archive.read("FOTA_Capture.pcapng"), capture)
 
     async def test_readiness_reports_database_health_without_leaking_errors(self):
         status, result = await self.request("GET", "/health/ready")
