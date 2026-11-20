@@ -1,6 +1,7 @@
 import ast
 import asyncio
 from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib.util
 import io
@@ -159,7 +160,8 @@ class CampaignServerTests(unittest.IsolatedAsyncioTestCase):
             "connected_tbms": {}, "pending_tbms": {}, "pending_auth": {},
             "secrets": SimpleNamespace(token_hex=lambda size: "challenge"),
             "AUTH_SECRET": "secret", "json": json, "hashlib": hashlib,
-            "time": time, "add_log": lambda message: None,
+            "time": time, "datetime": datetime, "timedelta": timedelta, "timezone": timezone,
+            "add_log": lambda message: None,
             "asyncio": asyncio, "CAMPAIGN_ACK_TIMEOUT_SECONDS": 600,
             "asynccontextmanager": asynccontextmanager, "suppress": suppress,
             "CAMPAIGN_RUNNING_TIMEOUT_SECONDS": 600,
@@ -182,14 +184,14 @@ class CampaignServerTests(unittest.IsolatedAsyncioTestCase):
             PUBLIC_URL="https://fota-server-v2-0.onrender.com",
             CAMPAIGN_ACK_TIMEOUT_SECONDS=600, CAMPAIGN_RUNNING_TIMEOUT_SECONDS=600,
             CAMPAIGN_WATCHDOG_INTERVAL_SECONDS=5, CAMPAIGN_RETRY_DELAY_SECONDS=30,
-            CAMPAIGN_MAX_RETRIES=10, CAMPAIGN_AUTO_CLOSE_DAYS=5
+            CAMPAIGN_MAX_RETRIES=10, CAMPAIGN_AUTO_CLOSE_DAYS=30
         )
         self.namespace["storage"] = SimpleNamespace(get_sha256=self.namespace["get_sha256"])
         load_server_functions(self.namespace, {
             "stop_campaign", "websocket_endpoint", "campaign", "execute_campaign", "get_campaigns",
             "migrate_spaak_schema", "normalize_latest_firmware", "firmware_history", "version_key",
             "is_active_campaign_status", "campaign_timeout_error", "initialize_campaign_timers", "expire_stalled_campaigns",
-            "close_terminal_campaigns",
+            "close_expired_campaigns",
             "campaign_progress_value", "campaign_lifespan", "campaign_payload", "fail_campaign",
             "dispatch_waiting_campaigns", "record_campaign_event", "format_epoch", "start_scheduled_campaigns"
         })
@@ -682,39 +684,54 @@ class CampaignServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.status(), "completed")
         self.assertEqual(self.database.execute("SELECT sgw_version FROM registered_tbms").fetchone()[0], "2.0")
 
-    async def test_auto_close_terminal_campaigns_after_five_days(self):
-        now = 2_000_000
-        cutoff = now - 5 * 24 * 60 * 60
+    async def test_close_only_old_failed_and_stopped_campaigns_by_creation_date(self):
+        now = datetime(2026, 11, 20, 12, tzinfo=timezone.utc)
+        cutoff = now - timedelta(days=30)
         records = [
-            ("success", "completed", cutoff, None, None),
-            ("executed", "executed", cutoff - 1, None, None),
-            ("failure", "failed", None, cutoff, None),
-            ("send-failure", "send_failed", None, cutoff - 1, None),
-            ("checksum-failure", "checksum_failed", None, cutoff - 2, None),
-            ("transfer-failure", "transfer_failed", None, cutoff - 3, None),
-            ("stopped", "stopped", None, None, cutoff),
-            ("recent", "completed", cutoff + 1, None, None),
-            ("retry", "waiting_retry", None, cutoff - 100, None),
-            ("running", "running", cutoff - 100, cutoff - 100, None),
-            ("pending", "pending", cutoff - 100, cutoff - 100, None)
+            ("old-failed", "failed", (cutoff - timedelta(seconds=1)).isoformat(sep=" ")),
+            ("old-send-failed", "send_failed", (cutoff - timedelta(days=1)).isoformat(sep=" ")),
+            ("old-checksum-failed", "checksum_failed", (cutoff - timedelta(days=1)).isoformat(sep=" ")),
+            ("old-stopped", "stopped", (cutoff - timedelta(days=1)).isoformat(sep=" ")),
+            ("old-cancelled", "cancelled", (cutoff - timedelta(days=1)).isoformat(sep=" ")),
+            ("exactly-thirty-days", "failed", cutoff.isoformat(sep=" ")),
+            ("recent-failed", "failed", (cutoff + timedelta(seconds=1)).isoformat(sep=" ")),
+            ("old-completed", "completed", (cutoff - timedelta(days=1)).isoformat(sep=" ")),
+            ("old-executed", "executed", (cutoff - timedelta(days=1)).isoformat(sep=" ")),
+            ("old-retry", "waiting_retry", (cutoff - timedelta(days=1)).isoformat(sep=" ")),
+            ("old-running", "running", (cutoff - timedelta(days=1)).isoformat(sep=" ")),
+            ("old-pending", "pending", (cutoff - timedelta(days=1)).isoformat(sep=" "))
         ]
         self.database.executemany(
             """INSERT INTO campaigns
-            (campaign_id, vin, status, completed_at, failed_at, stopped_at)
-            VALUES (?, 'VIN1', ?, ?, ?, ?)""",
+            (campaign_id, vin, status, created_at)
+            VALUES (?, 'VIN1', ?, ?)""",
             records
         )
 
-        closed = self.namespace["close_terminal_campaigns"](now)
-        self.assertEqual(set(closed), {record[0] for record in records[:7]})
+        closed = self.namespace["close_expired_campaigns"](now=now)
+        expected_closed = {record[0] for record in records[:5]}
+        self.assertEqual(set(closed), expected_closed)
         statuses = dict(self.database.execute("SELECT campaign_id, status FROM campaigns").fetchall())
-        self.assertEqual(statuses["recent"], "completed")
-        self.assertEqual(statuses["retry"], "waiting_retry")
-        self.assertEqual(statuses["running"], "running")
-        self.assertEqual(statuses["pending"], "pending")
+        self.assertEqual(statuses["exactly-thirty-days"], "failed")
+        self.assertEqual(statuses["recent-failed"], "failed")
+        self.assertEqual(statuses["old-completed"], "completed")
+        self.assertEqual(statuses["old-executed"], "executed")
+        self.assertEqual(statuses["old-retry"], "waiting_retry")
+        self.assertEqual(statuses["old-running"], "running")
+        self.assertEqual(statuses["old-pending"], "pending")
         self.assertEqual(self.database.execute(
             "SELECT COUNT(*) FROM campaign_events WHERE status='CLOSED'"
-        ).fetchone()[0], len(closed))
+        ).fetchone()[0], len(expected_closed))
+
+        created_at = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat(sep=" ")
+        self.database.execute(
+            "INSERT INTO campaigns (campaign_id, vin, status, created_at) VALUES (?, 'VIN1', 'stopped', ?)",
+            ("closed-on-read", created_at)
+        )
+        await self.namespace["get_campaigns"]()
+        self.assertEqual(self.database.execute(
+            "SELECT status FROM campaigns WHERE campaign_id='closed-on-read'"
+        ).fetchone()[0], "closed")
 
 
 class ModularApplicationTests(unittest.IsolatedAsyncioTestCase):

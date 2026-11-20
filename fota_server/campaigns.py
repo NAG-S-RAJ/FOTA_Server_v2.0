@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import time
@@ -257,33 +258,36 @@ async def expire_stalled_campaigns(now=None):
     return failures
 
 
-def close_terminal_campaigns(now=None):
-    now = time.time() if now is None else now
-    cutoff = now - settings.CAMPAIGN_AUTO_CLOSE_DAYS * 24 * 60 * 60
+def close_expired_campaigns(campaign_id=None, now=None):
+    now = datetime.now(timezone.utc) if now is None else now
+    cutoff = now - timedelta(days=settings.CAMPAIGN_AUTO_CLOSE_DAYS)
+    conditions = """
+        created_at < %s AND (
+            LOWER(status) LIKE %s OR LOWER(status) IN ('error', 'stopped', 'cancelled', 'canceled')
+        )
+    """
+    parameters = [cutoff, "%fail%"]
+    if campaign_id is not None:
+        conditions += " AND campaign_id=%s"
+        parameters.append(campaign_id)
     database.ensure_connection()
     database.cursor.execute(
-        """
+        f"""
         UPDATE campaigns
         SET status='closed'
-        WHERE (
-            LOWER(status) IN ('completed', 'executed') AND completed_at IS NOT NULL AND completed_at <= %s
-        ) OR (
-            LOWER(status) IN ('failed', 'send_failed', 'checksum_failed', 'transfer_failed')
-            AND failed_at IS NOT NULL AND failed_at <= %s
-        ) OR (
-            LOWER(status)='stopped' AND stopped_at IS NOT NULL AND stopped_at <= %s
-        )
+        WHERE {conditions}
         RETURNING campaign_id, vin
         """,
-        (cutoff, cutoff, cutoff)
+        parameters
     )
     closed = database.cursor.fetchall()
     database.conn.commit()
     for campaign_id, vin in closed:
-        state.add_log(f"[CAMPAIGN][AUTO_CLOSED] campaign={campaign_id} vin={vin} after "
-                      f"{settings.CAMPAIGN_AUTO_CLOSE_DAYS} days")
+        state.add_log(f"[CAMPAIGN][AUTO_CLOSED] campaign={campaign_id} vin={vin} "
+                      f"created more than {settings.CAMPAIGN_AUTO_CLOSE_DAYS} days ago")
         record_campaign_event(campaign_id, vin, "Campaign Closed", "CLOSED",
-                              f"Automatically closed after {settings.CAMPAIGN_AUTO_CLOSE_DAYS} days.")
+                              f"Automatically closed because it was created more than "
+                              f"{settings.CAMPAIGN_AUTO_CLOSE_DAYS} days ago.")
     return [campaign_id for campaign_id, _ in closed]
 
 
@@ -349,10 +353,6 @@ async def campaign_watchdog():
             await expire_stalled_campaigns()
         except Exception as error:
             state.add_log(f"[WATCHDOG][WATCHDOG_ERROR] {type(error).__name__}: {error}")
-        try:
-            close_terminal_campaigns()
-        except Exception as error:
-            state.add_log(f"[WATCHDOG][AUTO_CLOSE_ERROR] {type(error).__name__}: {error}")
         await asyncio.sleep(settings.CAMPAIGN_WATCHDOG_INTERVAL_SECONDS)
 
 
@@ -385,6 +385,7 @@ async def delete_campaign(campaign_id: str):
 @router.get("/campaigns")
 async def get_campaigns():
 
+    close_expired_campaigns()
     database.ensure_connection()
 
     database.cursor.execute("""
@@ -447,6 +448,7 @@ CAMPAIGN_DETAIL_FIELDS = (
 
 @router.get("/campaign/{campaign_id}")
 async def get_campaign(campaign_id: str):
+    close_expired_campaigns(campaign_id)
     database.ensure_connection()
     database.cursor.execute(
         f"SELECT {', '.join(CAMPAIGN_DETAIL_FIELDS)} FROM campaigns WHERE campaign_id=%s",
