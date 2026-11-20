@@ -47,10 +47,13 @@ async def readiness():
 @router.get("/download_logs")
 async def download_logs():
     capture_path = os.path.join(settings.CAPTURE_FOLDER, "FOTA_Capture.pcapng")
-    if not os.path.isfile(capture_path):
+    log_text = "\n".join(state.logs)
+    include_logs = bool(log_text)
+    include_capture = os.path.isfile(capture_path)
+    if not include_logs and not include_capture:
         raise HTTPException(
             status_code=404,
-            detail={"code": "CAPTURE_NOT_FOUND", "message": "No PCAPNG capture has been uploaded"}
+            detail={"code": "LOGS_NOT_FOUND", "message": "No server log or PCAPNG capture is available"}
         )
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -60,8 +63,10 @@ async def download_logs():
     os.close(descriptor)
     try:
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as archive:
-            archive.writestr("FOTA_Server_Log.txt", "\n".join(state.logs))
-            archive.write(capture_path, arcname="FOTA_Capture.pcapng")
+            if include_logs:
+                archive.writestr("FOTA_Server_Log.txt", log_text)
+            if include_capture:
+                archive.write(capture_path, arcname="FOTA_Capture.pcapng")
     except OSError:
         if os.path.exists(archive_path):
             os.remove(archive_path)

@@ -803,6 +803,27 @@ class ModularApplicationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(b"server log line", archive.read("FOTA_Server_Log.txt"))
             self.assertEqual(archive.read("FOTA_Capture.pcapng"), capture)
 
+    async def test_download_logs_zip_includes_only_available_files(self):
+        self.state.logs[:] = ["server log only"]
+        status, _, body = await self.request_raw("GET", "/download_logs")
+        self.assertEqual(status, 200)
+        with zipfile.ZipFile(io.BytesIO(body)) as archive:
+            self.assertEqual(archive.namelist(), ["FOTA_Server_Log.txt"])
+
+        capture = b"\x0a\x0d\x0d\x0a" + b"capture only"
+        await self.request_raw("PUT", "/upload_capture", body=capture)
+        self.state.logs.clear()
+        status, _, body = await self.request_raw("GET", "/download_logs")
+        self.assertEqual(status, 200)
+        with zipfile.ZipFile(io.BytesIO(body)) as archive:
+            self.assertEqual(archive.namelist(), ["FOTA_Capture.pcapng"])
+            self.assertEqual(archive.read("FOTA_Capture.pcapng"), capture)
+
+        os.remove(Path(self.settings.CAPTURE_FOLDER) / "FOTA_Capture.pcapng")
+        status, _, body = await self.request_raw("GET", "/download_logs")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body)["detail"]["code"], "LOGS_NOT_FOUND")
+
     async def test_readiness_reports_database_health_without_leaking_errors(self):
         status, result = await self.request("GET", "/health/ready")
         self.assertEqual((status, result), (200, {"status": "ready", "checks": {"database": "ready"}}))
