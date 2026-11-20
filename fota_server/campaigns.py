@@ -257,6 +257,36 @@ async def expire_stalled_campaigns(now=None):
     return failures
 
 
+def close_terminal_campaigns(now=None):
+    now = time.time() if now is None else now
+    cutoff = now - settings.CAMPAIGN_AUTO_CLOSE_DAYS * 24 * 60 * 60
+    database.ensure_connection()
+    database.cursor.execute(
+        """
+        UPDATE campaigns
+        SET status='closed'
+        WHERE (
+            LOWER(status) IN ('completed', 'executed') AND completed_at IS NOT NULL AND completed_at <= %s
+        ) OR (
+            LOWER(status) IN ('failed', 'send_failed', 'checksum_failed', 'transfer_failed')
+            AND failed_at IS NOT NULL AND failed_at <= %s
+        ) OR (
+            LOWER(status)='stopped' AND stopped_at IS NOT NULL AND stopped_at <= %s
+        )
+        RETURNING campaign_id, vin
+        """,
+        (cutoff, cutoff, cutoff)
+    )
+    closed = database.cursor.fetchall()
+    database.conn.commit()
+    for campaign_id, vin in closed:
+        state.add_log(f"[CAMPAIGN][AUTO_CLOSED] campaign={campaign_id} vin={vin} after "
+                      f"{settings.CAMPAIGN_AUTO_CLOSE_DAYS} days")
+        record_campaign_event(campaign_id, vin, "Campaign Closed", "CLOSED",
+                              f"Automatically closed after {settings.CAMPAIGN_AUTO_CLOSE_DAYS} days.")
+    return [campaign_id for campaign_id, _ in closed]
+
+
 async def start_scheduled_campaigns(now=None):
     now = time.time() if now is None else now
     database.ensure_connection()
@@ -319,6 +349,10 @@ async def campaign_watchdog():
             await expire_stalled_campaigns()
         except Exception as error:
             state.add_log(f"[WATCHDOG][WATCHDOG_ERROR] {type(error).__name__}: {error}")
+        try:
+            close_terminal_campaigns()
+        except Exception as error:
+            state.add_log(f"[WATCHDOG][AUTO_CLOSE_ERROR] {type(error).__name__}: {error}")
         await asyncio.sleep(settings.CAMPAIGN_WATCHDOG_INTERVAL_SECONDS)
 
 
@@ -405,7 +439,7 @@ async def get_campaigns():
 CAMPAIGN_DETAIL_FIELDS = (
     "campaign_id", "vin", "target_ecu", "campaign_name", "sgw_target_version",
     "spaak_target_version", "sgw_firmware", "spaak_firmware", "status", "created_at",
-    "error_code", "error_message", "failed_at", "execution_started_at",
+    "error_code", "error_message", "failed_at", "stopped_at", "execution_started_at",
     "last_progress_at", "completed_at", "max_retries", "retry_count",
     "initiation", "scheduled_at", "description"
 )
@@ -447,14 +481,14 @@ async def stop_campaign(campaign_id: str):
     database.cursor.execute(
         """
         UPDATE campaigns
-        SET status='stopped'
+        SET status='stopped', stopped_at=%s
         WHERE campaign_id=%s
             AND (LOWER(status) IN ('sent', 'acknowledged', 'running', 'executing', 'in_progress',
                                    'waiting_retry', 'waiting_vehicle', 'scheduled')
                  OR LOWER(status) LIKE %s)
         RETURNING vin
         """,
-             (campaign_id, "downloading%")
+               (time.time(), campaign_id, "downloading%")
     )
     row = database.cursor.fetchone()
     database.conn.commit()

@@ -132,7 +132,7 @@ class CampaignServerTests(unittest.IsolatedAsyncioTestCase):
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 execution_started_at REAL, last_heartbeat_at REAL, last_progress_at REAL,
                 failed_at REAL, error_code TEXT, error_message TEXT,
-                max_retries INTEGER DEFAULT 0, retry_count INTEGER DEFAULT 0, completed_at REAL,
+                max_retries INTEGER DEFAULT 0, retry_count INTEGER DEFAULT 0, completed_at REAL, stopped_at REAL,
                 initiation TEXT DEFAULT 'immediate', scheduled_at REAL, description TEXT
             );
             CREATE TABLE campaign_events (
@@ -182,13 +182,14 @@ class CampaignServerTests(unittest.IsolatedAsyncioTestCase):
             PUBLIC_URL="https://fota-server-v2-0.onrender.com",
             CAMPAIGN_ACK_TIMEOUT_SECONDS=600, CAMPAIGN_RUNNING_TIMEOUT_SECONDS=600,
             CAMPAIGN_WATCHDOG_INTERVAL_SECONDS=5, CAMPAIGN_RETRY_DELAY_SECONDS=30,
-            CAMPAIGN_MAX_RETRIES=10
+            CAMPAIGN_MAX_RETRIES=10, CAMPAIGN_AUTO_CLOSE_DAYS=5
         )
         self.namespace["storage"] = SimpleNamespace(get_sha256=self.namespace["get_sha256"])
         load_server_functions(self.namespace, {
             "stop_campaign", "websocket_endpoint", "campaign", "execute_campaign", "get_campaigns",
             "migrate_spaak_schema", "normalize_latest_firmware", "firmware_history", "version_key",
             "is_active_campaign_status", "campaign_timeout_error", "initialize_campaign_timers", "expire_stalled_campaigns",
+            "close_terminal_campaigns",
             "campaign_progress_value", "campaign_lifespan", "campaign_payload", "fail_campaign",
             "dispatch_waiting_campaigns", "record_campaign_event", "format_epoch", "start_scheduled_campaigns"
         })
@@ -681,6 +682,40 @@ class CampaignServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.status(), "completed")
         self.assertEqual(self.database.execute("SELECT sgw_version FROM registered_tbms").fetchone()[0], "2.0")
 
+    async def test_auto_close_terminal_campaigns_after_five_days(self):
+        now = 2_000_000
+        cutoff = now - 5 * 24 * 60 * 60
+        records = [
+            ("success", "completed", cutoff, None, None),
+            ("executed", "executed", cutoff - 1, None, None),
+            ("failure", "failed", None, cutoff, None),
+            ("send-failure", "send_failed", None, cutoff - 1, None),
+            ("checksum-failure", "checksum_failed", None, cutoff - 2, None),
+            ("transfer-failure", "transfer_failed", None, cutoff - 3, None),
+            ("stopped", "stopped", None, None, cutoff),
+            ("recent", "completed", cutoff + 1, None, None),
+            ("retry", "waiting_retry", None, cutoff - 100, None),
+            ("running", "running", cutoff - 100, cutoff - 100, None),
+            ("pending", "pending", cutoff - 100, cutoff - 100, None)
+        ]
+        self.database.executemany(
+            """INSERT INTO campaigns
+            (campaign_id, vin, status, completed_at, failed_at, stopped_at)
+            VALUES (?, 'VIN1', ?, ?, ?, ?)""",
+            records
+        )
+
+        closed = self.namespace["close_terminal_campaigns"](now)
+        self.assertEqual(set(closed), {record[0] for record in records[:7]})
+        statuses = dict(self.database.execute("SELECT campaign_id, status FROM campaigns").fetchall())
+        self.assertEqual(statuses["recent"], "completed")
+        self.assertEqual(statuses["retry"], "waiting_retry")
+        self.assertEqual(statuses["running"], "running")
+        self.assertEqual(statuses["pending"], "pending")
+        self.assertEqual(self.database.execute(
+            "SELECT COUNT(*) FROM campaign_events WHERE status='CLOSED'"
+        ).fetchone()[0], len(closed))
+
 
 class ModularApplicationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -704,7 +739,7 @@ class ModularApplicationTests(unittest.IsolatedAsyncioTestCase):
                 sgw_firmware TEXT, spaak_firmware TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 execution_started_at REAL, last_heartbeat_at REAL, last_progress_at REAL,
                 failed_at REAL, error_code TEXT, error_message TEXT,
-                max_retries INTEGER DEFAULT 0, retry_count INTEGER DEFAULT 0, completed_at REAL,
+                max_retries INTEGER DEFAULT 0, retry_count INTEGER DEFAULT 0, completed_at REAL, stopped_at REAL,
                 initiation TEXT DEFAULT 'immediate', scheduled_at REAL, description TEXT
             );
             CREATE TABLE campaign_events (

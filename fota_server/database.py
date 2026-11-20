@@ -120,6 +120,7 @@ def initialize_database():
         ("max_retries", "INTEGER DEFAULT 0"),
         ("retry_count", "INTEGER DEFAULT 0"),
         ("completed_at", "DOUBLE PRECISION"),
+        ("stopped_at", "DOUBLE PRECISION"),
         ("initiation", "VARCHAR(20) DEFAULT 'immediate'"),
         ("scheduled_at", "DOUBLE PRECISION"),
         ("description", "TEXT")
@@ -138,6 +139,18 @@ def initialize_database():
     )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS campaign_events_campaign_idx ON campaign_events (campaign_id, id)")
+    cursor.execute("""
+        UPDATE campaigns AS campaign
+        SET stopped_at=EXTRACT(EPOCH FROM stop_event.created_at)
+        FROM campaign_events AS stop_event
+        WHERE campaign.status='stopped' AND campaign.stopped_at IS NULL
+          AND stop_event.campaign_id=campaign.campaign_id AND stop_event.status='STOPPED'
+          AND NOT EXISTS (
+              SELECT 1 FROM campaign_events AS newer_stop
+              WHERE newer_stop.campaign_id=campaign.campaign_id
+                AND newer_stop.status='STOPPED' AND newer_stop.id > stop_event.id
+          )
+    """)
 
     conn.commit()
 
