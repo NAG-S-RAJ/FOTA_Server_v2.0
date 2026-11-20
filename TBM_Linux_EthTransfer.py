@@ -1,6 +1,6 @@
 import json
 import threading
-from tbm_monitor import TbmMonitor
+from tbm_monitor import SGW_MAC, TbmMonitor
 monitor = TbmMonitor("TBM_Linux_EthTransfer")
 from campaign_control import CampaignControl, CampaignStopped
 
@@ -86,12 +86,13 @@ SERVER_WS = "wss://fota-server-v2-0.onrender.com/ws"
 
 DOWNLOAD_DIR = "/home/pi/FirmwareFiles"
 
-# Direct Ethernet connection to the Windows laptop.
-# Configure the laptop Ethernet adapter as 192.168.50.2/24.
-LAPTOP_IP = "192.168.50.2"
-LAPTOP_UPLOAD_PORT = 8001
-LAPTOP_UPLOAD_URL = f"http://{LAPTOP_IP}:{LAPTOP_UPLOAD_PORT}/upload"
+# Direct Ethernet connection to the SGW firmware receiver.
+SGW_IP = "192.168.4.112"
+SGW_UPLOAD_PORT = 8001
+SGW_UPLOAD_URL = f"http://{SGW_IP}:{SGW_UPLOAD_PORT}/upload"
 ETHERNET_CONNECT_TIMEOUT = 3
+ETHERNET_RETRY_INTERVAL = 5
+ETHERNET_RETRY_TIMEOUT = 10 * 60
 FILE_TRANSFER_TIMEOUT = 180
 
 os.makedirs(
@@ -160,37 +161,72 @@ def calculate_sha256(filepath):
 # ETHERNET CHECK + FIRMWARE TRANSFER TO LAPTOP
 # ============================================================
 
-def check_laptop_connection():
-    """Check that the laptop's file receiver is reachable over Ethernet."""
-    print(f"\nChecking Ethernet connection to laptop {LAPTOP_IP}:{LAPTOP_UPLOAD_PORT}...")
+def get_neighbor_mac(ip_address):
+    """Return the resolved Ethernet MAC for an IPv4 neighbor, if present."""
     try:
-        with socket.create_connection(
-            (LAPTOP_IP, LAPTOP_UPLOAD_PORT),
-            timeout=ETHERNET_CONNECT_TIMEOUT,
-        ):
-            print("Laptop Ethernet connection: OK")
-            return True
-    except OSError as exc:
-        print(f"Laptop Ethernet connection FAILED: {exc}")
-        print("Check the cable, laptop IP, and that receiver.py is running on the laptop.")
-        return False
+        with open("/proc/net/arp", "r", encoding="ascii") as arp_table:
+            next(arp_table, None)
+            for entry in arp_table:
+                fields = entry.split()
+                if len(fields) >= 4 and fields[0] == ip_address and fields[2] != "0x0":
+                    return fields[3].lower()
+    except OSError:
+        pass
+    return None
 
 
-def transfer_firmware_to_laptop(filepath):
-    """Upload a checksum-verified firmware file to the laptop receiver."""
+def check_sgw_connection(ws=None):
+    """Retry the SGW connection for up to ten minutes and verify its MAC address."""
+    expected_mac = SGW_MAC.lower()
+    print(f"\nChecking Ethernet connection to SGW {SGW_IP}:{SGW_UPLOAD_PORT} ({expected_mac})...")
+    deadline = time.monotonic() + ETHERNET_RETRY_TIMEOUT
+    while True:
+        if ws is not None:
+            ws.check_active()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print(f"SGW connection unavailable after {ETHERNET_RETRY_TIMEOUT // 60} minutes.")
+            return False
+        try:
+            with socket.create_connection(
+                (SGW_IP, SGW_UPLOAD_PORT),
+                timeout=min(ETHERNET_CONNECT_TIMEOUT, remaining),
+            ):
+                actual_mac = get_neighbor_mac(SGW_IP)
+                if actual_mac != expected_mac:
+                    raise OSError(f"SGW IP resolved to MAC {actual_mac or 'unknown'}, expected {expected_mac}")
+                print(f"SGW Ethernet connection: OK ({SGW_IP} / {actual_mac})")
+                return True
+        except OSError as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                print(f"SGW connection unavailable after {ETHERNET_RETRY_TIMEOUT // 60} minutes: {exc}")
+                return False
+            wait_time = min(ETHERNET_RETRY_INTERVAL, remaining)
+            print(f"SGW Ethernet connection failed: {exc}; retrying in {wait_time:.0f}s.")
+            stop_event = getattr(ws, "stop_event", None)
+            if stop_event is not None:
+                if stop_event.wait(wait_time):
+                    ws.check_active()
+            else:
+                time.sleep(wait_time)
+
+
+def transfer_firmware_to_sgw(filepath, ws=None):
+    """Upload a checksum-verified firmware file to the SGW receiver."""
     filepath = os.path.abspath(filepath)
     if not os.path.isfile(filepath):
         raise FileNotFoundError(f"Firmware file not found: {filepath}")
 
-    if not check_laptop_connection():
-        raise ConnectionError("Laptop receiver is not reachable over Ethernet")
+    if not check_sgw_connection(ws):
+        raise ConnectionError(f"SGW receiver at {SGW_IP} is not reachable after 10 minutes")
 
     filename = os.path.basename(filepath)
-    print(f"Transferring {filename} to laptop {LAPTOP_IP}...")
+    print(f"Transferring {filename} to SGW {SGW_IP}...")
 
     with open(filepath, "rb") as firmware_file:
         response = requests.post(
-            LAPTOP_UPLOAD_URL,
+            SGW_UPLOAD_URL,
             files={"file": (filename, firmware_file, "application/octet-stream")},
             timeout=FILE_TRANSFER_TIMEOUT,
         )
@@ -198,9 +234,9 @@ def transfer_firmware_to_laptop(filepath):
     response.raise_for_status()
     result = response.json()
     if result.get("status") != "received":
-        raise RuntimeError(f"Laptop did not confirm file receipt: {result}")
+        raise RuntimeError(f"SGW did not confirm file receipt: {result}")
 
-    print(f"Transfer confirmed by laptop: {result.get('filename', filename)}")
+    print(f"Transfer confirmed by SGW: {result.get('filename', filename)}")
     return result
 
 
@@ -508,7 +544,7 @@ def on_message(ws, message, campaign_worker=False):
             try:
                 for firmware_path in firmware_to_transfer:
                     ws.check_active()
-                    transfer_firmware_to_laptop(firmware_path)
+                    transfer_firmware_to_sgw(firmware_path, ws)
                     ws.check_active()
             except CampaignStopped:
                 raise
